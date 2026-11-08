@@ -63,6 +63,9 @@ final class ReaderController: NSObject, ObservableObject {
     /// Highlights and notes added since the last save. Saving merges these onto the file on disk
     /// rather than writing this window's copy over it, so edits made meanwhile survive.
     private var pending: [(page: Int, annotation: PDFAnnotation)] = []
+    /// Form values as last loaded or saved, by field name. Typing in a field changes the open
+    /// document only; saving compares against this and writes what changed.
+    private var savedFieldValues: [String: String] = [:]
     /// True while opening a document, so the initial scroll doesn't overwrite the saved page.
     private var restoring = false
 
@@ -95,6 +98,19 @@ final class ReaderController: NSObject, ObservableObject {
         observers.append(center.addObserver(forName: .PDFViewSelectionChanged, object: pdfView, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.hasSelection = !(self?.pdfView.currentSelection?.string ?? "").isEmpty }
         })
+        // Form fields: a click on a checkbox or radio, or the end of typing in a text field.
+        observers.append(center.addObserver(forName: .PDFViewAnnotationHit, object: pdfView, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated {
+                guard let a = n.userInfo?["PDFAnnotationHit"] as? PDFAnnotation, a.type == "Widget" else { return }
+                self?.scheduleFieldSave()
+            }
+        })
+        observers.append(center.addObserver(forName: NSControl.textDidEndEditingNotification, object: nil, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated {
+                guard let self, let v = n.object as? NSView, v.isDescendant(of: self.pdfView) else { return }
+                self.scheduleFieldSave()
+            }
+        })
     }
 
     deinit {
@@ -120,6 +136,11 @@ final class ReaderController: NSObject, ObservableObject {
             stopSpeaking()
             clearSearch()
         }
+        // The same document again (after an edit, undo or agent change): stay where the reader was.
+        let keep: (page: Int, point: CGPoint, scale: CGFloat)? = {
+            guard sameDocument, let d = pdfView.currentDestination, let p = d.page, let old = pdfView.document else { return nil }
+            return (old.index(for: p), d.point, pdfView.scaleFactor)
+        }()
         documentID = rec.id
         loadedModifiedAt = Library.shared.record(rec.id)?.modifiedAt ?? rec.modifiedAt
         restoring = true
@@ -127,6 +148,7 @@ final class ReaderController: NSObject, ObservableObject {
         pdfView.select(nil, on: nil)
         Objects.hydrate(document, folder: Library.shared.folder(for: rec.id))
         pdfView.document = document
+        savedFieldValues = Self.fieldValues(document)
         pageCount = document.pageCount
         buildOutline(document)
         setTheme(theme)
@@ -134,7 +156,11 @@ final class ReaderController: NSObject, ObservableObject {
         // PDFView ignores go(to:) until it has laid the document out.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            if start > 0, let p = document.page(at: min(start, document.pageCount - 1)) {
+            if let keep, let p = document.page(at: min(keep.page, document.pageCount - 1)) {
+                if !self.pdfView.autoScales { self.pdfView.scaleFactor = keep.scale }
+                self.pdfView.layoutDocumentView()
+                self.pdfView.go(to: PDFDestination(page: p, at: keep.point))
+            } else if start > 0, let p = document.page(at: min(start, document.pageCount - 1)) {
                 self.pdfView.layoutDocumentView()
                 self.pdfView.go(to: p)
             }
@@ -193,8 +219,8 @@ final class ReaderController: NSObject, ObservableObject {
         let box = CGRect(x: minX, y: minY, width: max(4, maxX - minX), height: max(4, maxY - minY)).insetBy(dx: -6, dy: -6).intersection(crop)
         // Drawn beside the page (in the gutter): nothing is marked.
         guard !box.isNull, box.width >= 1, box.height >= 1, box.minX.isFinite, box.minY.isFinite else { return nil }
-        let text = (page.selection(for: box)?.string ?? "")
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        // Whole words only: a loop drawn loosely clips the neighbours' letters at its edges.
+        let text = page.selection(for: box).map(EditOps.wholeWords) ?? ""
         let space = EditOps.PageSpace(page)
         let topLeft = space.topLeft(box)
         // Picture: the area as shown plus some context, with the strokes in red.
@@ -350,6 +376,51 @@ final class ReaderController: NSObject, ObservableObject {
         scheduleSave()
     }
 
+    /// Every field's value by name: text as typed, checkboxes "on"/"off", radios their chosen option.
+    static func fieldValues(_ doc: PDFDocument) -> [String: String] {
+        var out: [String: String] = [:]
+        for i in 0..<doc.pageCount {
+            for a in doc.page(at: i)?.annotations ?? [] where a.type == "Widget" {
+                guard let name = a.fieldName, !name.isEmpty else { continue }
+                switch a.widgetFieldType {
+                case .text, .choice:
+                    out[name] = a.widgetStringValue ?? ""
+                case .button where a.widgetControlType == .checkBoxControl:
+                    out[name] = a.buttonWidgetState == .onState ? "on" : "off"
+                case .button where a.widgetControlType == .radioButtonControl:
+                    if a.buttonWidgetState == .onState { out[name] = a.buttonWidgetStateString }
+                    else if out[name] == nil { out[name] = "" }
+                default: continue
+                }
+            }
+        }
+        return out
+    }
+
+    private func scheduleFieldSave() {
+        // The value lands on the widget just after the notification; read it on the next save.
+        saveTask?.cancel()
+        saveTask = Task { try? await Task.sleep(for: .seconds(0.8)); if !Task.isCancelled { flushAnnotations() } }
+    }
+
+    /// Writes form values typed or clicked on screen since the last save (one undo point).
+    private func flushFields() {
+        guard let id = documentID, let doc = pdfView.document else { return }
+        let now = Self.fieldValues(doc)
+        // Off for a radio group means no option chosen; fillForm can't express that, so skip it.
+        let changed = now.filter { name, value in savedFieldValues[name] != value && !(value.isEmpty && savedFieldValues[name] == nil) }
+        guard !changed.isEmpty else { return }
+        let onDiskBefore = Library.shared.record(id)?.modifiedAt
+        do {
+            let rec = try EzPDF.shared.fillForm(id, values: changed).record
+            savedFieldValues = now
+            lastSavedModifiedAt = rec.modifiedAt
+            if onDiskBefore == loadedModifiedAt { loadedModifiedAt = rec.modifiedAt }
+        } catch {
+            onError?("Couldn't save the form: \(error.localizedDescription)")
+        }
+    }
+
     private func scheduleSave() {
         unsavedAnnotations = true
         saveTask?.cancel()
@@ -361,6 +432,7 @@ final class ReaderController: NSObject, ObservableObject {
     func flushAnnotations() {
         pdfView.flushNudge()
         saveTask?.cancel()
+        flushFields()
         guard let id = documentID, !pending.isEmpty else { unsavedAnnotations = false; return }
         let items = pending
         pending = []

@@ -205,12 +205,13 @@ public enum EditOps {
         var done: [Replacement] = []
         var didntFit: [String] = []
         var wordsByPage: [Int: [TextFragment]] = [:]
+        var insideWords = 0
         for sel in doc.findString(find, withOptions: opts) {
             // A match that runs onto the next page can't be rewritten in one place: skip it.
             guard done.count < limit, sel.pages.count == 1, let page = sel.pages.first else { continue }
             let index = doc.index(for: page)
             if let pages, !pages.contains(index) { continue }
-            if wholeWord, !isWholeWord(sel, in: page) { continue }
+            if wholeWord, !isWholeWord(sel, in: page) { insideWords += 1; continue }
             let words = wordsByPage[index] ?? PageText.words(page: page, index: index)
             wordsByPage[index] = words
             do {
@@ -224,6 +225,9 @@ public enum EditOps {
         guard !done.isEmpty else {
             if !didntFit.isEmpty {
                 throw EzPDFError.invalidInput(didntFit.count == 1 ? String(didntFit[0].drop { $0 != ":" }.dropFirst(2)) : didntFit.prefix(3).joined(separator: " "))
+            }
+            if insideWords > 0 {
+                throw EzPDFError.invalidInput("“\(find)” only appears inside other words or numbers (\(insideWords) place\(insideWords == 1 ? "" : "s")). Give the whole word or number as printed, e.g. “October 14” rather than “14”.")
             }
             throw EzPDFError.invalidInput("“\(find)” doesn't appear\(pages == nil ? "" : " on those pages").")
         }
@@ -582,6 +586,27 @@ public enum EditOps {
 
     /// True when the match isn't part of a longer word: the character before it and the one after
     /// it (each looked at on its own, so "ll" in "lll" is judged right) aren't letters or digits.
+    /// The words in a selection made by area (a pen mark, a drawn box), without the pieces of
+    /// words cut at its edges: a loop around "October 14" that clips "date:" and "by" gives
+    /// "October 14, 2026," rather than "e: October 14, 2026, b". Whitespace is collapsed.
+    public static func wholeWords(_ sel: PDFSelection) -> String {
+        let raw = (sel.string ?? "").replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        var words = raw.split(separator: " ").map(String.init)
+        guard words.count > 1 else { return raw }
+        let letters = CharacterSet.alphanumerics
+        func continues(atStart: Bool) -> Bool {
+            guard let wider = sel.copy() as? PDFSelection else { return false }
+            if atStart { wider.extend(atStart: 1) } else { wider.extend(atEnd: 1) }
+            let s = (wider.string ?? "")
+            guard s.count > (sel.string ?? "").count, let c = (atStart ? s.first : s.last)?.unicodeScalars.first else { return false }
+            return letters.contains(c)
+        }
+        if let first = words.first?.unicodeScalars.first, letters.contains(first), continues(atStart: true) { words.removeFirst() }
+        if words.count > 1, let last = words.last?.unicodeScalars.last, letters.contains(last), continues(atStart: false) { words.removeLast() }
+        return words.joined(separator: " ")
+    }
+
     static func isWholeWord(_ sel: PDFSelection, in page: PDFPage) -> Bool {
         let inner = sel.string ?? ""
         let letters = CharacterSet.alphanumerics

@@ -31,6 +31,10 @@ extension EzPDF {
             let found = try await FormDetector.makeFillable(doc)
             guard try record(rec.id, strict: true).modifiedAt == revision else { continue }
             guard !found.fields.isEmpty else {
+                let existing = (0..<doc.pageCount).reduce(0) { n, i in n + (doc.page(at: i)?.annotations.filter { $0.type == "Widget" }.count ?? 0) }
+                if existing > 0 {
+                    throw EzPDFError.invalidInput("“\(rec.title)” is already fillable: it has \(existing) field\(existing == 1 ? "" : "s"). Click a field to type in it.")
+                }
                 throw EzPDFError.invalidInput("No blanks found in “\(rec.title)”: no writing lines, boxes or checkboxes to turn into fields.")
             }
             let saved = try commitEdit(rec.id, doc)

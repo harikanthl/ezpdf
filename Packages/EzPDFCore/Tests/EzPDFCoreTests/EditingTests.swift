@@ -602,3 +602,50 @@ func reload(_ doc: PDFDocument) -> PDFDocument { PDFDocument(data: doc.dataRepre
         #expect(SearchIndex.ftsQuery("say \"hi\" (now)") == #""say" "hi" "(now)"*"#)
     }
 }
+
+@Suite struct WholeWordEditTests {
+    /// "Make this the 12th" once became find "1" → "12" and rewrote 418, 0187 and both dates.
+    @Test func shortFindLeavesOtherNumbersAlone() throws {
+        let doc = PDFDocument(data: makePDF(pages: 1, lines: { _ in ["418 Market Street", "Invoice NW-2026-0187", "Due date: October 14, 2026"] }))!
+        #expect(throws: EzPDFError.self) {
+            try EditOps.replaceText(doc, find: "1", with: "12", wholeWord: true)
+        }
+        do {
+            try EditOps.replaceText(doc, find: "1", with: "12", wholeWord: true)
+        } catch {
+            #expect(error.localizedDescription.contains("inside other words"))
+        }
+        let changes = try EditOps.replaceText(doc, find: "14", with: "12", wholeWord: true)
+        #expect(changes.count == 1)
+    }
+}
+
+@Suite struct MarkedWordsTests {
+    /// A loop around "October 14, 2026," drawn a little wide clips "date:" and "by".
+    @Test func dropsWordPiecesAtTheEdges() throws {
+        let doc = PDFDocument(data: makePDF(pages: 1, lines: { _ in ["Due date: October 14, 2026, by bank transfer."] }))!
+        let page = doc.page(at: 0)!
+        let target = try #require(doc.findString("October 14, 2026,", withOptions: []).first)
+        let box = target.bounds(for: page).insetBy(dx: -12, dy: -4)
+        let sel = try #require(page.selection(for: box))
+        let raw = (sel.string ?? "").trimmingCharacters(in: .whitespaces)
+        #expect(raw != "October 14, 2026,", "the box should clip neighbours for this test: \(raw)")
+        #expect(EditOps.wholeWords(sel) == "October 14, 2026,")
+    }
+
+    @Test func keepsASingleWord() throws {
+        let doc = PDFDocument(data: makePDF(pages: 1, lines: { _ in ["Total due"] }))!
+        let page = doc.page(at: 0)!
+        let target = try #require(doc.findString("Total", withOptions: []).first)
+        #expect(EditOps.wholeWords(try #require(page.selection(for: target.bounds(for: page)))) == "Total")
+    }
+}
+
+@Suite struct MarkEditPunctuationTests {
+    @Test func keepsTheTrailingComma() {
+        #expect(AssistantToolbox.keepEdgePunctuation(of: "October 14, 2026,", in: "October 12, 2026") == "October 12, 2026,")
+        #expect(AssistantToolbox.keepEdgePunctuation(of: "October 14, 2026,", in: "October 12, 2026,") == "October 12, 2026,")
+        #expect(AssistantToolbox.keepEdgePunctuation(of: "Jane Doe", in: "Jayne Doe") == "Jayne Doe")
+        #expect(AssistantToolbox.keepEdgePunctuation(of: "(draft)", in: "final") == "(final)")
+    }
+}

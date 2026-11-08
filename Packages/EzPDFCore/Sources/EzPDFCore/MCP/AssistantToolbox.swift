@@ -131,12 +131,24 @@ public final class AssistantToolbox {
             let new = intent.replacement.trimmingCharacters(in: .whitespacesAndNewlines)
             // A "replacement" that just appends the request to the words is the model misreading it.
             guard !new.isEmpty, new != words, !new.lowercased().contains(request.lowercased().prefix(20)) else { return nil }
-            return (words, new, "\(page)")
+            return (words, keepEdgePunctuation(of: words, in: new), "\(page)")
         case "delete":
             return (words, "", "\(page)")
         default:
             return nil
         }
+    }
+
+    /// The small model tends to drop the comma or period at the end of the marked words
+    /// ("October 14, 2026," → "October 12, 2026"), which would join the line's next words onto it.
+    /// Whatever punctuation the marked words start or end with stays.
+    nonisolated static func keepEdgePunctuation(of marked: String, in new: String) -> String {
+        let marks = CharacterSet(charactersIn: ",.;:!?)]\u{201D}\u{2019}")
+        let opening = CharacterSet(charactersIn: "([\u{201C}\u{2018}")
+        var out = new.trimmingCharacters(in: .whitespaces)
+        if let last = marked.unicodeScalars.last, marks.contains(last), out.unicodeScalars.last != last { out.append(Character(last)) }
+        if let first = marked.unicodeScalars.first, opening.contains(first), out.unicodeScalars.first != first { out.insert(Character(first), at: out.startIndex) }
+        return out
     }
 
     /// A one-line description of a call for the confirmation card.

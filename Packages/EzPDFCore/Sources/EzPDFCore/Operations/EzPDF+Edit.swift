@@ -119,6 +119,17 @@ extension EzPDF {
         let pageNumber = page ?? doc.pageCount
         guard pageNumber >= 1, pageNumber <= doc.pageCount else { throw EzPDFError.invalidInput("No page \(pageNumber).") }
         var box = rect
+        // A signature line the form detector recognises (a rule labelled "Signature" beside, above or
+        // under it): sign on it, sitting on the line.
+        if box == nil, let page = doc.page(at: pageNumber - 1) {
+            var words = PageText.words(page: page, index: pageNumber - 1)
+            if words.count < 5 { words = await PageText.ocrFragments(page: page, index: pageNumber - 1) }
+            if let line = FormDetector.detect(page: page, index: pageNumber - 1, words: words).last(where: { $0.kind == .signature }) {
+                let f = line.rect
+                let width = min(max(120, f.width - 8), 220)
+                box = CGRect(x: f.minX + 4, y: f.maxY - 38, width: width, height: 38)
+            }
+        }
         if box == nil {
             let layout = try await pageLayout(rec.id, page: pageNumber)
             let cue = try! NSRegularExpression(pattern: #"(?i)\b(signature|sign here|signed|authori[sz]ed by|signatory)\b"#)

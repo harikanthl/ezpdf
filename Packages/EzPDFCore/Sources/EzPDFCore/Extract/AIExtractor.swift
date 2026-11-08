@@ -87,14 +87,14 @@ enum AIExtractor {
     struct AIMarkIntent {
         @Guide(description: "replace: the request changes what the marked words say. delete: the request removes them. other: anything else, such as signing, adding something next to them, formatting, or questions.")
         var action: String
-        @Guide(description: "For replace: the complete new text that should stand where the marked words are, in the same form as the marked words (keep labels like 'Due Date:' if they were marked). Empty otherwise.")
+        @Guide(description: "For replace: the marked words with only what the request names changed; every other word, number and punctuation mark stays exactly as printed. Dates: 'the 12th' or 'the twelfth' is the day of the month, so 'October 14, 2026,' becomes 'October 12, 2026,' (never December). Keep labels like 'Due Date:' if they were marked. Empty otherwise.")
         var replacement: String
     }
 
     /// What a pen mark plus a short spoken request means, as a structured answer the small model
     /// fills reliably: replace or delete the marked words, or "other" for the full assistant.
     static func markIntent(marked: String, request: String) async throws -> (action: String, replacement: String) {
-        let session = LanguageModelSession(instructions: "You turn a request about some marked words into an edit. Answer only with the fields asked for.")
+        let session = LanguageModelSession(instructions: "You turn a request about some marked words into an edit. Change only the part the request names and copy the rest exactly. Examples: marked \"October 14, 2026,\" + \"make this the 12th\" → \"October 12, 2026,\". Marked \"$2,400.00\" + \"make it 2,600\" → \"$2,600.00\". Marked \"Jane Doe\" + \"spell it Jayne\" → \"Jayne Doe\". Answer only with the fields asked for.")
         let r = try await session.respond(to: "Marked words: \"\(marked.prefix(400))\"\nRequest: \"\(request.prefix(400))\"", generating: AIMarkIntent.self).content
         return (r.action.lowercased().trimmingCharacters(in: .whitespaces), r.replacement)
     }

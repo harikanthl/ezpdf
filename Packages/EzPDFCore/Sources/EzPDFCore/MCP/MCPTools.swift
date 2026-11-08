@@ -228,14 +228,14 @@ enum MCPTools {
                         "replace": S.string("What those words should say instead, e.g. \"12/01/2026\""),
                         "pages": S.string("Only these pages, e.g. 1-3"),
                         "match_case": S.bool("Match upper/lower case (default false)"),
-                        "whole_word": S.bool("Only whole words (default false)"),
+                        "whole_word": S.bool("Only whole words (default true: \"1\" won't change the 1 inside 418 or 2026). Set false only to change part of a word."),
                     ], required: ["id", "find", "replace"]),
                     readOnly: false, destructive: true) { a, ctx in
                 guard let find = a["find"] as? String, !find.isEmpty, let rep = a["replace"] as? String else { throw EzPDFError.invalidInput("Give find and replace.") }
                 // The new words go in the document's own font: make sure it's here first.
                 await ops.prepareFonts(try a.need("id"))
                 let r = try ops.replaceText(try a.need("id"), find: find, with: rep, pages: a.str("pages"),
-                                            matchCase: a.bool("match_case") ?? false, wholeWord: a.bool("whole_word") ?? false)
+                                            matchCase: a.bool("match_case") ?? false, wholeWord: a.bool("whole_word") ?? true)
                 let pages = Set(r.changes.map(\.page)).sorted().map(String.init).joined(separator: ", ")
                 // What the edit checks adjusted or noticed, once each.
                 var notes: [String] = []
@@ -299,7 +299,11 @@ enum MCPTools {
                 }
                 let image = a.str("image_base64").flatMap { Data(base64Encoded: $0, options: .ignoreUnknownCharacters) }
                 let r = try await ops.sign(try a.need("id"), name: a.str("name"), imageData: image, page: a.int("page", in: 1...100_000), rect: rect)
-                return ToolOutput(text: "Signed on page \(r.page) at x \(Int(r.rect.minX)), y \(Int(r.rect.minY)).", structured: doc(r.record))
+                // Plain words (the assistant shows and repeats this); where it went is in the structured result.
+                var out = doc(r.record)
+                out["signature"] = ["page": r.page, "x": Int(r.rect.minX), "y": Int(r.rect.minY), "width": Int(r.rect.width), "height": Int(r.rect.height)]
+                let who = a.str("name").map { " as “\($0)”" } ?? ""
+                return ToolOutput(text: "Signed page \(r.page)\(who).", structured: out)
             },
 
             MCPTool(name: "add_header_footer", title: "Header, footer, page numbers, logo",
