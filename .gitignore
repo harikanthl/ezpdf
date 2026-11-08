@@ -1,0 +1,8 @@
+build/
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+.DS_Store
+BrowserExtension/build/
+# Unused Xcode template from project creation
+/ezpdf/

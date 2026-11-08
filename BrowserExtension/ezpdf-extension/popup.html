@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="images/icon-32.png" width="18" height="18" alt="">
+    <span class="brand">ezpdf</span>
+    <span id="status" class="status" title="Connection to the ezpdf app"></span>
+  </header>
+
+  <section id="offline" class="notice" hidden>
+    <p>ezpdf isn't running on this Mac.</p>
+    <a id="launch" class="btn primary" href="ezpdf://">Open ezpdf</a>
+  </section>
+
+  <section id="main">
+    <div class="page">
+      <div id="title" class="title">This page</div>
+      <div id="host" class="host"></div>
+    </div>
+
+    <div class="presets" role="radiogroup" aria-label="Page size">
+      <button data-preset="kindle" role="radio">Kindle</button>
+      <button data-preset="phone" role="radio">Phone</button>
+      <button data-preset="letter" role="radio">Letter</button>
+      <button data-preset="web" role="radio" title="Keep the site's own design">As is</button>
+    </div>
+
+    <div id="actions">
+      <button id="pdf" class="btn primary wide">Make PDF <kbd>↩</kbd></button>
+      <div class="row">
+        <button id="kindle" class="btn" data-flow="kindle">To Kindle</button>
+        <button id="epub" class="btn" data-flow="epub">EPUB</button>
+        <button id="extract" class="btn" data-flow="extract" title="Bank statements, invoices, tables → Excel">Extract data</button>
+      </div>
+      <label class="toggle"><input type="checkbox" id="asSeen"> Use the page as I see it <span class="hint">(signed-in pages)</span></label>
+    </div>
+
+    <div id="progress" class="progress" hidden>
+      <div class="bar"><span></span></div>
+      <div id="detail" class="detail">Starting</div>
+    </div>
+
+    <div id="result" class="result" hidden>
+      <div id="message" class="message"></div>
+      <div class="row">
+        <button id="open" class="btn">Open in ezpdf</button>
+        <button id="reveal" class="btn" hidden>Show in Finder</button>
+        <button id="again" class="btn ghost">Done</button>
+      </div>
+    </div>
+
+    <div id="drop" class="drop">Drop a link here</div>
+  </section>
+  <script src="popup.js"></script>
+</body>
+</html>
