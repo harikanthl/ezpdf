@@ -516,13 +516,27 @@ struct ReaderView: View {
     }
 
     /// Returns nil when the change was made, else a message for the sheet.
-    private func replaceSelection(_ info: EditOps.SelectionInfo, with new: String) -> String? {
+    private func replaceSelection(_ info: EditOps.SelectionInfo, with new: String) -> ReplaceSheet.Failure? {
         reader.flushAnnotations()
         do {
             let r = try app.ops.replaceSelection(record.id, info, with: new)
             reader.pdfView.clearSelection()
             let done = new.isEmpty ? "Erased on page \(info.page + 1)" : "Changed on page \(info.page + 1)"
             app.show(([done] + r.notes).joined(separator: ". "))
+            return nil
+        } catch EzPDFError.doesNotFit(let message) where app.ops.canReflow(record.id) {
+            let replaced = (try? app.ops.pageChangesSinceLayout(record.id)) ?? []
+            return ReplaceSheet.Failure(message: message, reflow: (replaced, { text in await reflowSelection(info, with: text) }))
+        } catch { return ReplaceSheet.Failure(message: error.localizedDescription, reflow: nil) }
+    }
+
+    /// The change made in the article the document came from, laid out again.
+    private func reflowSelection(_ info: EditOps.SelectionInfo, with new: String) async -> String? {
+        reader.flushAnnotations()
+        do {
+            let rec = try await app.ops.reflowSelection(record.id, info, with: new)
+            reader.pdfView.clearSelection()
+            app.show("Changed in the article and laid it out again (\(rec.pageCount) pages). Undo puts it back.", documentID: rec.id)
             return nil
         } catch { return error.localizedDescription }
     }

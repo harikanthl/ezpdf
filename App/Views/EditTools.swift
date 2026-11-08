@@ -131,13 +131,20 @@ struct PlacementSheet: View {
 }
 
 /// "Change selected text": the selection, and what it should say instead. Errors show here, and
-/// the sheet stays open until the change is made.
+/// the sheet stays open until the change is made. A change too long for its paragraph in a
+/// document made from a web page can be made in the article instead, laying it all out again.
 struct ReplaceSheet: View {
+    struct Failure {
+        var message: String
+        /// The article can be laid out again with the change; `replaced` lists page changes that would go.
+        var reflow: (replaced: [String], run: (String) async -> String?)?
+    }
     let original: String
-    var onDone: (String) -> String?        // nil when it worked, else what went wrong
+    var onDone: (String) -> Failure?        // nil when it worked
     @Environment(\.dismiss) private var dismiss
     @State private var replacement = ""
-    @State private var error: String?
+    @State private var failure: Failure?
+    @State private var reflowing = false
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -146,17 +153,38 @@ struct ReplaceSheet: View {
             Text("“\(original)”").font(.callout).foregroundStyle(.secondary).lineLimit(3)
             TextField("New text", text: $replacement, axis: .vertical).lineLimit(1...6)
                 .textFieldStyle(.roundedBorder).frame(width: 380).focused($focused)
-            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange) }
-            Text("Keeps the original font, size and color, in the same place. Leave it empty to erase. To remove sensitive text for good, use Redact.")
+            if let failure {
+                Label(failure.message, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true).frame(width: 380, alignment: .leading)
+                if let reflow = failure.reflow {
+                    Text(reflow.replaced.isEmpty
+                         ? "This document was made from a web page: Reflow Article makes the change there and lays the whole article out again, so everything after it moves along."
+                         : "This document was made from a web page: Reflow Article makes the change there and lays the whole article out again. It replaces \(reflow.replaced.joined(separator: " and ")) since it was laid out; Undo brings them back.")
+                        .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).frame(width: 380, alignment: .leading)
+                }
+            }
+            Text("Keeps the original font, size and color, and moves the rest of the line along. The old words are taken out of the page. Leave it empty to erase. To remove images or drawings too, use Redact.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).frame(width: 380, alignment: .leading)
             HStack {
                 Spacer()
+                if reflowing { ProgressView().controlSize(.small) }
                 Button("Cancel") { dismiss() }.buttonStyle(PressableStyle()).keyboardShortcut(.cancelAction)
+                if let reflow = failure?.reflow {
+                    Button("Reflow Article") {
+                        reflowing = true
+                        Task {
+                            let message = await reflow.run(replacement)
+                            reflowing = false
+                            if let message { withAnimation(Motion.outFast) { failure = Failure(message: message, reflow: nil) } } else { dismiss() }
+                        }
+                    }
+                    .buttonStyle(PressableStyle()).disabled(reflowing)
+                }
                 Button("Change") {
-                    if let e = onDone(replacement) { withAnimation(Motion.outFast) { error = e } } else { dismiss() }
+                    if let f = onDone(replacement) { withAnimation(Motion.outFast) { failure = f } } else { dismiss() }
                 }
                 .buttonStyle(PressableStyle(prominent: true)).keyboardShortcut(.defaultAction)
-                .disabled(replacement == original)
+                .disabled(replacement == original || reflowing)
             }
         }
         .padding(18)

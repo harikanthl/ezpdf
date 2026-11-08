@@ -23,6 +23,9 @@ public enum EditOps {
         case text(String, rect: CGRect, font: NSFont, color: NSColor, alignment: NSTextAlignment)
         case image(CGImage, rect: CGRect)
         case fill(CGRect, NSColor)
+        /// Old text going away: the glyphs under the area are taken out of the page (see
+        /// TextEraser), then the area is painted in its background color for anything else there.
+        case erase(CGRect, NSColor)
     }
 
     /// Redraws `index` with overlays on top. Overlay rects are top-left points of the page as shown,
@@ -51,13 +54,23 @@ public enum EditOps {
             let media = old.bounds(for: .mediaBox), crop = old.bounds(for: .cropBox)
             let space = PageSpace(old)
             ctx.beginPDFPage([kCGPDFContextMediaBox as String: boxData(media), kCGPDFContextCropBox as String: boxData(crop)] as CFDictionary)
-            ctx.drawPDFPage(old.pageRef!)
+            // Text being replaced leaves the page itself, so it can't be selected, searched or
+            // edited again under the new words. If the eraser can't read the page, it's painted over.
+            let eraseRects = (byPage[indices[k]] ?? []).compactMap { o -> CGRect? in
+                if case .erase(let r, _) = o { return space.pageRect(r) } else { return nil }
+            }
+            var source = old.pageRef!
+            if !eraseRects.isEmpty, let erased = TextEraser.erase(source, rects: eraseRects), erased.removed > 0,
+               let provider = CGDataProvider(data: erased.data as CFData), let cleaned = CGPDFDocument(provider)?.page(at: 1) {
+                source = cleaned
+            }
+            ctx.drawPDFPage(source)
             // From here on, draw in the shown page's space (bottom-left origin) so overlays come out upright.
             ctx.saveGState()
             ctx.concatenate(space.toPage)
             for o in byPage[indices[k]] ?? [] {
                 switch o {
-                case .fill(let r, let color):
+                case .fill(let r, let color), .erase(let r, let color):
                     ctx.setFillColor(color.cgColor)
                     ctx.fill(space.shownRect(r))
                 case .image(let img, let r):
@@ -191,10 +204,25 @@ public enum EditOps {
         public var notes: [String] = []
     }
 
-    /// Replaces text where it appears: covers each match with the background color sampled around
-    /// it, then writes the new text in the same font, size and color, on the same baseline.
-    /// The new words are real text. The old glyphs stay in the page's text layer under the cover
-    /// (PDFKit can't take glyphs out of a content stream), so use redaction to remove words for good.
+    /// Takes invisible text off these pages (words an earlier version of ezPDF painted over but left in
+    /// the text layer; see TextEraser.eraseHidden), so an edit sees only what the page shows. The
+    /// pages look exactly the same. Returns how many glyphs went.
+    @discardableResult
+    static func removeHiddenText(_ doc: PDFDocument, pages: [Int]) -> Int {
+        var total = 0
+        for i in Set(pages).sorted() {
+            guard let old = doc.page(at: i), let ref = old.pageRef, let r = TextEraser.eraseHidden(ref), r.removed > 0,
+                  let page = PDFDocument(data: r.data)?.page(at: 0) else { continue }
+            page.rotation = old.rotation
+            replacePage(doc, at: i, old: old, with: page)
+            total += r.removed
+        }
+        return total
+    }
+
+    /// Replaces text where it appears: takes the old words out of the page, then writes the new
+    /// text in the same font, size and color, on the same baseline, moving the rest of the line
+    /// and paragraph along (see EditCheck). The new words are real text.
     @discardableResult
     public static func replaceText(_ doc: PDFDocument, find: String, with replacement: String, pages: Set<Int>? = nil,
                                    matchCase: Bool = false, wholeWord: Bool = false, limit: Int = 500) throws -> [Replacement] {
@@ -206,6 +234,7 @@ public enum EditOps {
         var didntFit: [String] = []
         var wordsByPage: [Int: [TextFragment]] = [:]
         var insideWords = 0
+        removeHiddenText(doc, pages: doc.findString(find, withOptions: opts).compactMap { $0.pages.first.map(doc.index(for:)) })
         for sel in doc.findString(find, withOptions: opts) {
             // A match that runs onto the next page can't be rewritten in one place: skip it.
             guard done.count < limit, sel.pages.count == 1, let page = sel.pages.first else { continue }
@@ -224,7 +253,7 @@ public enum EditOps {
         }
         guard !done.isEmpty else {
             if !didntFit.isEmpty {
-                throw EzPDFError.invalidInput(didntFit.count == 1 ? String(didntFit[0].drop { $0 != ":" }.dropFirst(2)) : didntFit.prefix(3).joined(separator: " "))
+                throw EzPDFError.doesNotFit(didntFit.count == 1 ? String(didntFit[0].drop { $0 != ":" }.dropFirst(2)) : didntFit.prefix(3).joined(separator: " "))
             }
             if insideWords > 0 {
                 throw EzPDFError.invalidInput("“\(find)” only appears inside other words or numbers (\(insideWords) place\(insideWords == 1 ? "" : "s")). Give the whole word or number as printed, e.g. “October 14” rather than “14”.")
@@ -280,12 +309,17 @@ public enum EditOps {
     @discardableResult
     public static func replaceRegion(_ doc: PDFDocument, page index: Int, lines: [CGRect], text: String,
                                      font: NSFont, color: NSColor) throws -> [String] {
-        guard let page = doc.page(at: index), let first = lines.first, let last = lines.last else { throw EzPDFError.invalidInput("Nothing selected.") }
+        guard doc.page(at: index) != nil, let first = lines.first, let last = lines.last else { throw EzPDFError.invalidInput("Nothing selected.") }
+        removeHiddenText(doc, pages: [index])
+        guard let page = doc.page(at: index) else { throw EzPDFError.invalidInput("Nothing selected.") }
         let space = PageSpace(page)
-        // The same selection again, from the start of its first line box to the end of its last.
-        guard let sel = page.selection(from: space.pagePoint(CGPoint(x: first.minX + 0.5, y: first.midY)),
-                                       to: space.pagePoint(CGPoint(x: last.maxX - 0.5, y: last.midY))),
-              !(sel.string ?? "").isEmpty else {
+        // The same selection again: one line by its area (what's drawn there, whatever order the text
+        // layer lists it in); several lines from the start of the first box to the end of the last.
+        let again = lines.count == 1
+            ? page.selection(for: space.pageRect(first.insetBy(dx: 0.5, dy: first.height * 0.2)))
+            : page.selection(from: space.pagePoint(CGPoint(x: first.minX + 0.5, y: first.midY)),
+                             to: space.pagePoint(CGPoint(x: last.maxX - 0.5, y: last.midY)))
+        guard let sel = again, !(sel.string ?? "").trimmingCharacters(in: .whitespaces).isEmpty else {
             throw EzPDFError.invalidInput("That selection has no text in it anymore; select it again.")
         }
         do {
@@ -293,7 +327,7 @@ public enum EditOps {
             try compose(doc, page: index, overlays: plan.overlays)
             return plan.notes
         } catch let e as EditCheck.TooLong {
-            throw EzPDFError.invalidInput(e.message)
+            throw EzPDFError.doesNotFit(e.message)
         }
     }
 
@@ -600,6 +634,7 @@ public enum EditOps {
             if atStart { wider.extend(atStart: 1) } else { wider.extend(atEnd: 1) }
             let s = (wider.string ?? "")
             guard s.count > (sel.string ?? "").count, let c = (atStart ? s.first : s.last)?.unicodeScalars.first else { return false }
+            if wider.selectionsByLine().count > sel.selectionsByLine().count { return false }   // another line
             return letters.contains(c)
         }
         if let first = words.first?.unicodeScalars.first, letters.contains(first), continues(atStart: true) { words.removeFirst() }
@@ -615,6 +650,8 @@ public enum EditOps {
             if atStart { wider.extend(atStart: 1) } else { wider.extend(atEnd: 1) }
             let s = wider.string ?? ""
             guard s.count > inner.count else { return nil }      // at the start or end of the page
+            // The character is on another line: the word ends with its line.
+            if wider.selectionsByLine().count > sel.selectionsByLine().count { return nil }
             return (atStart ? s.first : s.last)?.unicodeScalars.first
         }
         let before = neighbor(atStart: true), after = neighbor(atStart: false)

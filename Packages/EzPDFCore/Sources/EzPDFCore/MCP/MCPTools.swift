@@ -221,7 +221,7 @@ enum MCPTools {
             },
 
             MCPTool(name: "edit_text", title: "Change text",
-                    description: "Replace words or lines in the document: each match is painted over in its background color and the new text is written in the same font, size and color on the same baseline. Use replace \"\" to erase. This changes how the page looks; for removing sensitive text use redact. Changes the document (undo_last_edit reverts).",
+                    description: "Replace words or lines in the document: the old words are taken out of the page and the new text is written in the same font, size and color on the same baseline, with the rest of the line and paragraph moved along. Use replace \"\" to erase. A change too long for its paragraph fails; in a document made from a web page, reflow: true makes it in the article and lays the whole article out again. Changes the document (undo_last_edit reverts).",
                     schema: S.object([
                         "id": S.string("Document id or title"),
                         "find": S.string("Only the exact words that are wrong, as printed, e.g. the old date \"11/13/2026\" (not its label)"),
@@ -229,13 +229,29 @@ enum MCPTools {
                         "pages": S.string("Only these pages, e.g. 1-3"),
                         "match_case": S.bool("Match upper/lower case (default false)"),
                         "whole_word": S.bool("Only whole words (default true: \"1\" won't change the 1 inside 418 or 2026). Set false only to change part of a word."),
+                        "reflow": S.bool("Documents made from a web page only: change the words in the article and lay the whole article out again, so longer text pushes everything after it along. Use when a change doesn't fit."),
+                        "replace_page_changes": S.bool("With reflow: go ahead even though changes were made directly on the pages since the article was laid out (they're replaced). Only after the person agreed."),
                     ], required: ["id", "find", "replace"]),
                     readOnly: false, destructive: true) { a, ctx in
                 guard let find = a["find"] as? String, !find.isEmpty, let rep = a["replace"] as? String else { throw EzPDFError.invalidInput("Give find and replace.") }
+                let id = try a.need("id")
+                if a.bool("reflow") == true {
+                    let lost = try ops.pageChangesSinceLayout(id)
+                    if !lost.isEmpty, a.bool("replace_page_changes") != true {
+                        throw EzPDFError.invalidInput("Laying the article out again would replace \(lost.joined(separator: " and ")) since it was laid out. Ask the person; if they agree, call again with replace_page_changes: true.")
+                    }
+                    let r = try await ops.reflowArticle(id, find: find, with: rep)
+                    return ToolOutput(text: "Changed \(r.count) place\(r.count == 1 ? "" : "s") in the article and laid it out again (\(r.record.pageCount) pages).", structured: doc(r.record))
+                }
                 // The new words go in the document's own font: make sure it's here first.
-                await ops.prepareFonts(try a.need("id"))
-                let r = try ops.replaceText(try a.need("id"), find: find, with: rep, pages: a.str("pages"),
+                await ops.prepareFonts(id)
+                let r: (record: DocumentRecord, changes: [EditOps.Replacement])
+                do {
+                    r = try ops.replaceText(id, find: find, with: rep, pages: a.str("pages"),
                                             matchCase: a.bool("match_case") ?? false, wholeWord: a.bool("whole_word") ?? true)
+                } catch EzPDFError.doesNotFit(let message) where ops.canReflow(id) {
+                    throw EzPDFError.doesNotFit(message + " This document was made from a web page: edit_text with reflow: true makes the change in the article and lays it all out again.")
+                }
                 let pages = Set(r.changes.map(\.page)).sorted().map(String.init).joined(separator: ", ")
                 // What the edit checks adjusted or noticed, once each.
                 var notes: [String] = []

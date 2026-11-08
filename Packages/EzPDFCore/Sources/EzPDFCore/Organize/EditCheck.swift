@@ -135,7 +135,7 @@ enum EditCheck {
         var overlays: [EditOps.Overlay] = []
         func cover(_ r: CGRect) {
             let bg = EditOps.backgroundColor(page, around: space.pageRect(r)) ?? .white
-            overlays.append(.fill(r.insetBy(dx: -1, dy: -1), bg))
+            overlays.append(.erase(r.insetBy(dx: -1, dy: -1), bg))
         }
         matchLines.forEach(cover)
         let matchLineRect = matchLines.last ?? first
@@ -186,7 +186,14 @@ enum EditCheck {
 
         // Fill line by line: what fits stays on the line, the rest carries to the next; stop as
         // soon as nothing carries over (lines further down keep their own text and look).
-        var carry = text + (rest?.text ?? "")
+        // The rest of the line follows the new words; where the page shows a gap but has no space
+        // character (some PDFs, and lines edited by earlier versions), the gap becomes a space.
+        var restText = rest?.text ?? ""
+        if let rest, let lastMatch = matchLines.last, !restText.isEmpty, restText.first?.isWhitespace == false,
+           text.last?.isWhitespace == false, rest.rect.minX - lastMatch.maxX > font.pointSize * 0.15 {
+            restText = " " + restText
+        }
+        var carry = text + restText
         var written: [(text: String, slot: Slot)] = []
         var i = 0
         while true {
@@ -202,6 +209,13 @@ enum EditCheck {
                 else { carry += " " + original }
             }
             let (fits, spill) = split(carry, font: font, width: right - slot.x)
+            // The match sits near the end of its line and the first word doesn't fit there: it starts
+            // the next line instead, as when typing.
+            if fits.isEmpty, !carry.isEmpty, i == 0, slot.x > left + 1, slots.count > 1 {
+                written.append(("", slot))
+                i += 1
+                continue
+            }
             guard !fits.isEmpty || carry.isEmpty else {
                 throw TooLong(message: "A word in “\(text)” is wider than the line, so nothing was changed.")
             }

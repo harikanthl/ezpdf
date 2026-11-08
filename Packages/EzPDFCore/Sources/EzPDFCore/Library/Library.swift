@@ -212,6 +212,8 @@ public enum EzPDFError: LocalizedError, Equatable {
     case invalidInput(String)
     case failed(String)
     case unavailable(String)
+    /// A text change that needs more room than its line and paragraph have (the type never shrinks).
+    case doesNotFit(String)
 
     public var errorDescription: String? {
         switch self {
@@ -219,6 +221,7 @@ public enum EzPDFError: LocalizedError, Equatable {
         case .invalidInput(let s): return s
         case .failed(let s): return s
         case .unavailable(let s): return s
+        case .doesNotFit(let s): return s
         }
     }
 }

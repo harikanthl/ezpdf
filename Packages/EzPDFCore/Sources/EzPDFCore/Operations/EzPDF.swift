@@ -364,7 +364,7 @@ public final class EzPDF {
     static func actionName(_ caller: String) -> String {
         let name = String(caller.prefix { $0 != "(" })
         let known: [String: String] = [
-            "pages": "Change pages", "addAnnotations": "Highlights and notes", "updateObject": "Move or edit a placed item",
+            "pages": "Change pages", "reflowArticle": "Reflow article", "addAnnotations": "Highlights and notes", "updateObject": "Move or edit a placed item",
             "deleteObject": "Delete a placed item", "stamp": "Header and footer", "fillForm": "Fill in the form", "redact": "Redact",
             "flatten": "Flatten", "makeFillable": "Make fillable", "replaceText": "Change text", "replaceSelection": "Change selected text",
             "addContent": "Add content", "optimize": "Improve the PDF", "setProperties": "Properties", "removeAnnotations": "Remove annotations",
