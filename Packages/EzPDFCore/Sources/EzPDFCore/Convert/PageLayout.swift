@@ -58,7 +58,7 @@ enum PageLayout {
     /// as soon as it's captured and then dropped, so memory stays flat on long documents.
     /// `truncated` is true when the content was longer than ezpdf keeps.
     static func renderPDF(session: WebSession, pageSize: CGSize, margin: CGFloat,
-                          contentWidth: CGFloat, metadata: Metadata) async throws -> (pdf: Data, truncated: Bool) {
+                          contentWidth: CGFloat, metadata: Metadata) async throws -> (pdf: Data, truncated: Bool, slices: [Range<Double>]) {
         let json = try await session.jsString(measureJS, timeout: 60)
         guard let measure = try? JSONDecoder().decode(Measure.self, from: Data(json.utf8)), measure.height.isFinite, measure.height > 0 else {
             throw EzPDFError.failed("Couldn't measure the page layout.")
@@ -81,7 +81,7 @@ enum PageLayout {
         }
         let composed = writer.finish()
         return (finish(composed, slices: slices, headings: measure.headings, pageSize: pageSize,
-                       margin: margin, metadata: metadata), truncated)
+                       margin: margin, metadata: metadata), truncated, slices)
     }
 
     /// Streams slices onto pages of one PDF.

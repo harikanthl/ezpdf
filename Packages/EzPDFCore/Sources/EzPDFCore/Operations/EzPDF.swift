@@ -311,8 +311,10 @@ public final class EzPDF {
 
     /// The PDF bytes, optionally only some pages.
     public func pdfData(_ id: String, pages: String? = nil) throws -> Data {
-        let (rec, doc) = try document(id)
-        if pages == nil || pages?.isEmpty == true { return try Data(contentsOf: library.pdfURL(for: rec.id)) }
+        let (rec, _) = try document(id)
+        let full = try deliverableData(rec.id)
+        if pages == nil || pages?.isEmpty == true { return full }
+        guard let doc = PDFDocument(data: full) else { throw EzPDFError.failed("Couldn't read the PDF.") }
         let sub = PageOps.extract(doc, pages: try PageOps.pages(pages, count: doc.pageCount))
         guard let d = sub.dataRepresentation() else { throw EzPDFError.failed("Couldn't cut those pages.") }
         return d
@@ -325,6 +327,8 @@ public final class EzPDF {
         guard let data = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the change.") }
         return try commit(id, data: data)
     }
+
+    func commitEditData(_ id: String, _ data: Data) throws -> DocumentRecord { try commit(id, data: data) }
 
     private func commit(_ id: String, data: Data) throws -> DocumentRecord {
         guard let check = PDFDocument(data: data), check.pageCount > 0 || check.isLocked else {
@@ -571,7 +575,8 @@ public final class EzPDF {
         guard FileManager.default.fileExists(atPath: src.path) else {
             throw EzPDFError.invalidInput("“\(rec.title)” has no \(format.rawValue.uppercased()). EPUB is made only for web articles.")
         }
-        return try write(try Data(contentsOf: src), name: safeName(rec.title), ext: format.rawValue, folder: folder)
+        let data = format == .pdf ? try deliverableData(rec.id) : try Data(contentsOf: src)
+        return try write(data, name: safeName(rec.title), ext: format.rawValue, folder: folder)
     }
 
     /// Writes only inside the export folder the user chose (callers can pick a subfolder of it).
@@ -601,8 +606,8 @@ public final class EzPDF {
         let rec = try record(id)
         let settings = KindleSender.Settings.load()
         let useEPUB = format.map { $0 == .epub } ?? (settings.preferEPUB && rec.hasEPUB)
-        let file = useEPUB ? library.epubURL(for: rec.id) : library.pdfURL(for: rec.id)
         if useEPUB, !rec.hasEPUB { throw EzPDFError.invalidInput("“\(rec.title)” has no EPUB.") }
+        let file = useEPUB ? library.epubURL(for: rec.id) : try deliverableFile(rec.id)
         try await KindleSender.send(file: file, title: rec.title, settings: settings)
         try library.update(rec.id) { $0.sentToKindleAt = Date() }
         return (try record(rec.id), useEPUB ? .epub : .pdf, settings.address)

@@ -150,8 +150,13 @@ public final class LocalServer {
             l.stateUpdateHandler = { [weak self] state in
                 Task { @MainActor in
                     switch state {
-                    case .ready: self?.isRunning = true; self?.lastError = nil
-                    case .failed(let e): self?.isRunning = false; self?.lastError = "Port \(port): \(e.localizedDescription)"
+                    case .ready: self?.isRunning = true; self?.lastError = nil; self?.retries = 0
+                    case .failed(let e):
+                        self?.isRunning = false
+                        self?.lastError = "Port \(port): \(e.localizedDescription)"
+                        // Right after a relaunch the old socket may still hold the port for a few
+                        // seconds; try again rather than staying off.
+                        self?.scheduleRetry(port: port)
                     case .cancelled: self?.isRunning = false
                     default: break
                     }
@@ -161,6 +166,17 @@ public final class LocalServer {
             listener = l
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    @ObservationIgnored private var retries = 0
+    private func scheduleRetry(port: UInt16) {
+        guard retries < 20 else { return }
+        retries += 1
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, !self.isRunning else { return }
+            self.start(port: port)
         }
     }
 

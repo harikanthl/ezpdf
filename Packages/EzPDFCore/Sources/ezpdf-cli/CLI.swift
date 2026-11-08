@@ -1,6 +1,7 @@
 import Foundation
 import EzPDFCore
 import PDFKit
+import OperatorLLM
 
 @MainActor
 enum CLI {
@@ -42,6 +43,93 @@ enum CLI {
                 print("pdf bytes: \(r.pdf.count) notes: \(r.notes)")
             case "rules":
                 do { try await WebConverter.checkRules(); print("rules compiled") } catch { print("rules error:", error) }
+            case "edit-test":
+                // Exercises the editing engine on a PDF and writes the result.
+                guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }
+                let r = try EditOps.replaceText(doc, find: args[3], with: args[4])
+                print("replaced:", r.map { "p\($0.page) \($0.old)→\($0.new)" })
+                try EditOps.addText(doc, page: 0, text: "Reviewed by ezpdf", rect: CGRect(x: 360, y: 40, width: 200, height: 20), fontSize: 11, color: .systemRed)
+                try EditOps.addShape(doc, page: 0, shape: .rectangle, rect: CGRect(x: 50, y: 150, width: 500, height: 30))
+                try EditOps.addTypedSignature(doc, page: 0, name: "Harikanth L", rect: CGRect(x: 380, y: 520, width: 180, height: 40))
+                let rr = EditOps.rects(of: "4821", in: doc, pages: nil)
+                for (p, rects) in rr { try EditOps.redact(doc, page: p, rects: rects) }
+                guard let out = doc.dataRepresentation() else { return 1 }
+                try out.write(to: URL(fileURLWithPath: args[2]))
+                print("text now:", (PDFDocument(data: out)?.page(at: 0)?.string ?? "").prefix(300))
+            case "assist":
+                // ezpdf-cli assist <file.pdf> "<instruction>"  — on-device assistant, changes applied.
+                let rec = try await EzPDF.shared.convert(files: [URL(fileURLWithPath: args[1])], source: .cli)
+                let toolbox = AssistantToolbox()
+                let wanted = AssistantToolbox.onDeviceTools
+                let specs = wanted.compactMap { toolbox.spec(named: $0) }.filter(\.flat).map { LLMToolSpec(name: $0.name, description: $0.description, parametersJSON: $0.schemaJSON) }
+                print("tools:", specs.map(\.name))
+                let tools = OnDeviceToolBridge.tools(specs) { call in
+                    let r = await toolbox.call(call.name, argumentsJSON: call.argumentsJSON, currentDocument: rec.id)
+                    print("→ \(call.name) \(call.argumentsJSON)\n  \(r.ok ? "ok" : "ERR"): \(r.text.prefix(200))")
+                    let t = r.text.count > 1500 ? String(r.text.prefix(1500)) + " [clipped]" : r.text
+                    return r.ok ? t : "Error: " + t
+                }
+                let prompt = "User: \(args[2])\n[The open document is “\(rec.title)” (id \(rec.id)), \(rec.pageCount) pages; the user is looking at page 1.]"
+                var reply = ""
+                for try await d in OnDeviceLLM(instructions: AssistantToolbox.compactInstructions).streamText(prompt: prompt, tools: tools) { reply += d }
+                print("assistant:", reply)
+                let out = URL(fileURLWithPath: args.count > 3 ? args[3] : "/tmp/assist.pdf")
+                try Data(contentsOf: EzPDF.shared.library.pdfURL(for: rec.id)).write(to: out)
+                _ = try? EzPDF.shared.delete(rec.id)
+            case "objects-test":
+                let ops = EzPDF.shared
+                let rec = try await ops.convert(files: [URL(fileURLWithPath: args[1])], source: .cli)
+                defer { _ = try? ops.delete(rec.id) }
+                try ops.addContent(rec.id, .init(kind: .text, page: 1, rect: CGRect(x: 380, y: 30, width: 200, height: 20), text: "APPROVED", fontSize: 16, color: .systemGreen))
+                try ops.addContent(rec.id, .init(kind: .signature, page: 1, rect: CGRect(x: 360, y: 560, width: 200, height: 40), text: "Hari L"))
+                let logo = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+                try ops.addContent(rec.id, .init(kind: .image, page: 1, rect: CGRect(x: 40, y: 20, width: 60, height: 60), imageData: logo))
+                var objs = try ops.objects(rec.id)
+                print("objects:", objs.map { "\($0.kind.rawValue) \($0.rect) \($0.text ?? "")" })
+                let text = objs.first { $0.kind == .text }!
+                try ops.updateObject(rec.id, object: text.id, .init(rect: CGRect(x: 400, y: 120, width: 180, height: 24), text: "APPROVED ✓", fontSize: 20, color: .systemBlue))
+                let sig = objs.first { $0.kind == .signature }!
+                try ops.deleteObject(rec.id, object: sig.id)
+                objs = try ops.objects(rec.id)
+                print("after:", objs.map { "\($0.kind.rawValue) \($0.rect) \($0.text ?? "") \($0.fontSize ?? 0)" })
+                let out = try ops.deliverableData(rec.id)
+                try out.write(to: URL(fileURLWithPath: args[3]))
+                let d = PDFDocument(data: out)!
+                print("deliverable annotations left:", d.page(at: 0)!.annotations.count, "| text has APPROVED:", (d.page(at: 0)!.string ?? "").contains("APPROVED"))
+            case "stamp-test":
+                let rec = try await EzPDF.shared.convert(files: [URL(fileURLWithPath: args[1])], source: .cli)
+                defer { _ = try? EzPDF.shared.delete(rec.id) }
+                var c = Stamps.Config()
+                c.headerRight = "Confidential · @date{MMM d, yyyy}"; c.footerCenter = "Page @page of @total"; c.footerRight = "@bates"
+                c.batesPrefix = "NW-"; c.logo = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+                _ = try EzPDF.shared.stamp(rec.id, c)
+                try Data(contentsOf: EzPDF.shared.library.pdfURL(for: rec.id)).write(to: URL(fileURLWithPath: args[3]))
+                print("text:", (PDFDocument(url: URL(fileURLWithPath: args[3]))?.page(at: 0)?.string ?? "").prefix(80))
+            case "templates":
+                // Renders every template to a folder (and fills a couple of fields in the invoice).
+                let dir = URL(fileURLWithPath: args[1])
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for t in DocTemplate.all {
+                    let values = t.id == "invoice" ? ["invoice_number": "INV-0042", "from_name": "Northwind Design", "item1_description": "Logo design", "total_due": "1,200.00", "rsvp_i_will_attend": "yes"] : [:]
+                    let data = try await TemplateRenderer.render(t, values: values)
+                    try data.write(to: dir.appendingPathComponent("\(t.id).pdf"))
+                    let d = PDFDocument(data: data)!
+                    let fields = (0..<d.pageCount).reduce(0) { $0 + (d.page(at: $1)?.annotations.filter { $0.type == "Widget" }.count ?? 0) }
+                    print(String(format: "%-20@ pages %d fields %3d / %3d", t.id as NSString, d.pageCount, fields, t.fieldNames.count))
+                }
+            case "logo":
+                // ezpdf-cli logo "<prompt>" <out-dir> [model-id]
+                let model = ImageGen.models.first { $0.id == (args.count > 3 ? args[3] : "apple") } ?? ImageGen.models[0]
+                let t0 = Date()
+                let imgs = try await ImageGen.generate(prompt: ImageGen.prompt(args[1], style: .minimal), model: model, count: 1)
+                for (i, d) in imgs.enumerated() {
+                    try d.write(to: URL(fileURLWithPath: args[2]).appendingPathComponent("logo\(i).png"))
+                    if let cut = try? ImageGen.removeBackground(d) { try cut.write(to: URL(fileURLWithPath: args[2]).appendingPathComponent("logo\(i)-cut.png")) }
+                }
+                print("images:", imgs.count, "secs:", Int(Date().timeIntervalSince(t0)))
+            case "cutout":
+                try ImageGen.removeBackground(Data(contentsOf: URL(fileURLWithPath: args[1]))).write(to: URL(fileURLWithPath: args[2]))
+                print("ok")
             case "lines":
                 guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }
                 for l in await PageText.lines(doc) {

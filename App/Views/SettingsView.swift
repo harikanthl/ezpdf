@@ -1,7 +1,7 @@
 import SwiftUI
 import EzPDFCore
 
-enum SettingsTab: String { case general, kindle, agents, browser, help }
+enum SettingsTab: String { case general, kindle, assistant, models, agents, browser, help }
 
 struct SettingsView: View {
     @AppStorage("ezpdf.settingsTab") private var tab = SettingsTab.general.rawValue
@@ -10,11 +10,13 @@ struct SettingsView: View {
         TabView(selection: $tab) {
             GeneralSettings().tabItem { Label("General", systemImage: "gearshape") }.tag(SettingsTab.general.rawValue)
             KindleSettings().tabItem { Label("Kindle", systemImage: "book.closed") }.tag(SettingsTab.kindle.rawValue)
+            AssistantSettings().tabItem { Label("Assistant", systemImage: "bubble.left.and.text.bubble.right") }.tag(SettingsTab.assistant.rawValue)
+            ModelsSettings().tabItem { Label("Models", systemImage: "cpu") }.tag(SettingsTab.models.rawValue)
             AgentSettings().tabItem { Label("Agents", systemImage: "sparkles") }.tag(SettingsTab.agents.rawValue)
             BrowserSettings().tabItem { Label("Browser", systemImage: "safari") }.tag(SettingsTab.browser.rawValue)
             HelpSettings().tabItem { Label("Help", systemImage: "questionmark.circle") }.tag(SettingsTab.help.rawValue)
         }
-        .frame(width: 600)
+        .frame(width: 680)
         .scenePadding()
     }
 }
@@ -282,6 +284,28 @@ struct HelpSettings: View {
             "The scissors menu splits a document, and Undo restores the version before your last change.",
             "In the ⋯ menu: Compress, Make Text Searchable (OCR for scans), and Add Page Numbers.",
         ], shortcut: "⌥⌘P switches between Read and Pages"),
+        Topic(title: "Edit a PDF", symbol: "pencil.tip.crop.circle", steps: [
+            "Open the pencil menu in the toolbar: Add Text, Sign, Add Image, Draw Box, White-out or Redact Area, then drag a box on the page.",
+            "Anything you add stays movable: click it, drag it, drag the corner dot to resize, press Delete to remove it, double-click to change the words, font, size or color.",
+            "Select words and choose Change Selected Text to reword them in the same font. Use Redact for anything that must be gone for good.",
+            "Header, Footer & Page Numbers adds page numbers, dates, Bates numbers and your logo to every page.",
+            "Drop a picture onto the page to place it there.",
+        ], shortcut: "⌘Z-style undo: ⋯ menu › Undo Last Change"),
+        Topic(title: "Mark & Talk", symbol: "pencil.and.scribble", steps: [
+            "Click the scribble pen in the toolbar (⇧⌘M). The assistant opens and starts listening.",
+            "Circle or underline the spot on the page while you say what to change, like “make this the 12th” or “put our logo here”.",
+            "Send. The assistant gets the exact words under your marks and edits that spot.",
+        ], shortcut: "⇧⌘M"),
+        Topic(title: "Templates", symbol: "doc.text.image", steps: [
+            "File › New from Template (⇧⌘N) has 20 ready documents: invoices, quotes, letters, an NDA, timesheets, forms and more.",
+            "Every blank is a real form field: click and type, or ask the assistant to fill it in.",
+            "Agreements and consent forms are starting points, not legal advice.",
+        ], shortcut: "⇧⌘N"),
+        Topic(title: "Logos and images", symbol: "wand.and.stars", steps: [
+            "Pencil menu › Generate Logo or Image. Describe it, pick a style, choose one of the results.",
+            "Apple Image Playground is free and works on this Mac. For sharper logos, add a fal.ai or OpenAI key in Settings › Assistant.",
+            "The background is removed and the logo lands on the page, ready to drag and resize.",
+        ]),
         Topic(title: "Bank statements and invoices", symbol: "tablecells", steps: [
             "Open the statement or invoice and click the table icon (or Document → Extract Data).",
             "Statements become a list of transactions. ezpdf checks every row against the running balance and warns you if something doesn't add up.",

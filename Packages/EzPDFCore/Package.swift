@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "EzPDFCore", targets: ["EzPDFCore"]),
         .executable(name: "ezpdf-cli", targets: ["ezpdf-cli"]),
     ],
+    dependencies: [.package(path: "../OperatorLLM")],
     targets: [
         .target(
             name: "EzPDFCore",
@@ -19,7 +20,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ezpdf-cli",
-            dependencies: ["EzPDFCore"],
+            dependencies: ["EzPDFCore", .product(name: "OperatorLLM", package: "OperatorLLM")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .testTarget(

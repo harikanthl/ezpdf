@@ -27,7 +27,9 @@ final class ReaderController: NSObject, ObservableObject {
         let page: Int
     }
 
-    let pdfView = PDFView()
+    let pdfView = EditablePDFView()
+    /// Asks the view to edit an object (double-click / Return): the object id and its current state.
+    var onEditObject: ((String, PDFAnnotation) -> Void)?
     private(set) var documentID: String?
 
     @Published var pageCount = 0
@@ -67,6 +69,12 @@ final class ReaderController: NSObject, ObservableObject {
         pdfView.pageShadowsEnabled = true
         pdfView.pageBreakMargins = NSEdgeInsets(top: 6, left: 6, bottom: 10, right: 6)
         synthesizer.delegate = self
+        pdfView.onCommit = { [weak self] a, page in self?.commitObject(a, on: page) }
+        pdfView.onDelete = { [weak self] a, page in self?.deleteObject(a, on: page) }
+        pdfView.onEdit = { [weak self] a, _ in
+            guard let id = Objects.objectID(a) else { return }
+            self?.onEditObject?(id, a)
+        }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: .PDFViewPageChanged, object: pdfView, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.syncPage() }
@@ -94,6 +102,8 @@ final class ReaderController: NSObject, ObservableObject {
         loadedModifiedAt = Library.shared.record(rec.id)?.modifiedAt ?? rec.modifiedAt
         restoring = true
         guard let document = PDFDocument(url: url) else { pdfView.document = nil; pageCount = 0; return }
+        pdfView.select(nil, on: nil)
+        Objects.hydrate(document, folder: Library.shared.folder(for: rec.id))
         pdfView.document = document
         pageCount = document.pageCount
         buildOutline(document)
@@ -111,6 +121,72 @@ final class ReaderController: NSObject, ObservableObject {
         }
         if sameDocument, !matches.isEmpty { clearSearch() }   // old selections belong to the old document
         syncZoom()
+    }
+
+    /// A rectangle drawn over the PDF view (SwiftUI coordinates, origin top-left) → the page it's on
+    /// and the rectangle in that page's points, origin top-left of the crop box.
+    func pageRect(fromView r: CGRect) -> (page: Int, rect: CGRect)? {
+        let h = pdfView.bounds.height
+        let nsRect = CGRect(x: r.minX, y: h - r.maxY, width: r.width, height: r.height)
+        guard let doc = pdfView.document,
+              let page = pdfView.page(for: CGPoint(x: nsRect.midX, y: nsRect.midY), nearest: true) else { return nil }
+        let p = pdfView.convert(nsRect, to: page)
+        let crop = page.bounds(for: .cropBox)
+        let topLeft = CGRect(x: p.minX - crop.minX, y: crop.maxY - p.maxY, width: p.width, height: p.height)
+        return (doc.index(for: page) + 1, topLeft)
+    }
+
+    /// Pen strokes (SwiftUI view coordinates) → the page they're on, their box in page points
+    /// (top-left), the words under them, and a picture of the area with the marks drawn on it.
+    func mark(from strokes: [[CGPoint]]) -> AssistantModel.Mark? {
+        let pts = strokes.flatMap { $0 }
+        guard !pts.isEmpty, let doc = pdfView.document else { return nil }
+        let h = pdfView.bounds.height
+        let ns = pts.map { CGPoint(x: $0.x, y: h - $0.y) }
+        let cx = ns.map(\.x).reduce(0, +) / CGFloat(ns.count), cy = ns.map(\.y).reduce(0, +) / CGFloat(ns.count)
+        guard let page = pdfView.page(for: CGPoint(x: cx, y: cy), nearest: true) else { return nil }
+        let pagePts = ns.map { pdfView.convert($0, to: page) }
+        guard let minX = pagePts.map(\.x).min(), let maxX = pagePts.map(\.x).max(),
+              let minY = pagePts.map(\.y).min(), let maxY = pagePts.map(\.y).max() else { return nil }
+        let crop = page.bounds(for: .cropBox)
+        let box = CGRect(x: minX, y: minY, width: max(4, maxX - minX), height: max(4, maxY - minY)).insetBy(dx: -6, dy: -6).intersection(crop)
+        let text = (page.selection(for: box)?.string ?? "")
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+        let topLeft = CGRect(x: box.minX - crop.minX, y: crop.maxY - box.maxY, width: box.width, height: box.height)
+        // Picture: the area plus some context, with the strokes in red.
+        let area = box.insetBy(dx: -40, dy: -30).intersection(crop)
+        let scale: CGFloat = 2
+        var png: Data?
+        if area.width > 2, area.height > 2, let ctx = CGContext(data: nil, width: Int(area.width * scale), height: Int(area.height * scale), bitsPerComponent: 8, bytesPerRow: 0,
+                                     space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+            ctx.setFillColor(NSColor.white.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: area.width * scale, height: area.height * scale))
+            ctx.scaleBy(x: scale, y: scale)
+            ctx.translateBy(x: -area.minX, y: -area.minY)
+            page.draw(with: .cropBox, to: ctx)
+            ctx.setStrokeColor(NSColor.systemRed.cgColor)
+            ctx.setLineWidth(2.5); ctx.setLineCap(.round); ctx.setLineJoin(.round)
+            var i = 0
+            for s in strokes {
+                let ps = s.map { pdfView.convert(CGPoint(x: $0.x, y: h - $0.y), to: page) }
+                i += s.count
+                guard ps.count > 1 else { continue }
+                ctx.addLines(between: ps)
+                ctx.strokePath()
+            }
+            if let img = ctx.makeImage() {
+                let rep = NSBitmapImageRep(cgImage: img)
+                png = rep.representation(using: .png, properties: [:])
+            }
+        }
+        return AssistantModel.Mark(page: doc.index(for: page) + 1, rect: topLeft, text: String(text.prefix(1000)), image: png)
+    }
+
+    /// The selected text and its page (1-based), for "change selected text".
+    var selectionForEdit: (text: String, page: Int)? {
+        guard let sel = pdfView.currentSelection, let text = sel.string?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty, let page = sel.pages.first, let doc = pdfView.document else { return nil }
+        return (text, doc.index(for: page) + 1)
     }
 
     // MARK: Navigation
@@ -256,6 +332,26 @@ final class ReaderController: NSObject, ObservableObject {
             pending = items + pending      // keep them; try again on the next save
             unsavedAnnotations = true
         }
+    }
+
+    // MARK: Objects
+
+    /// Saves a moved or resized object; the view already shows it, so no reload follows.
+    private func commitObject(_ a: PDFAnnotation, on page: PDFPage) {
+        guard let docID = documentID, let objectID = Objects.objectID(a), let doc = pdfView.document else { return }
+        flushAnnotations()
+        let crop = page.bounds(for: .cropBox)
+        let r = CGRect(x: a.bounds.minX - crop.minX, y: crop.maxY - a.bounds.maxY, width: a.bounds.width, height: a.bounds.height)
+        if let rec = try? EzPDF.shared.updateObject(docID, object: objectID, .init(page: doc.index(for: page) + 1, rect: r)) {
+            lastSavedModifiedAt = rec.modifiedAt
+        }
+    }
+
+    private func deleteObject(_ a: PDFAnnotation, on page: PDFPage) {
+        guard let docID = documentID, let objectID = Objects.objectID(a) else { return }
+        flushAnnotations()
+        page.removeAnnotation(a)
+        if let rec = try? EzPDF.shared.deleteObject(docID, object: objectID) { lastSavedModifiedAt = rec.modifiedAt }
     }
 
     // MARK: Read aloud

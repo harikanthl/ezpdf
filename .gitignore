@@ -6,3 +6,4 @@ DerivedData/
 BrowserExtension/build/
 # Unused Xcode template from project creation
 /ezpdf/
+.swiftpm/

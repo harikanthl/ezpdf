@@ -37,6 +37,8 @@ struct AppCommands: Commands {
             Button("Make PDF from Link…") { app.focusConvertField = true }.keyboardShortcut("l")
             Button("Make PDF from Files…") { Self.openFiles() }.keyboardShortcut("o")
             Button("Make PDF from Clipboard") { pasteLink() }.keyboardShortcut("v", modifiers: [.command, .shift])
+            Divider()
+            Button("New from Template…") { app.showTemplates = true }.keyboardShortcut("n", modifiers: [.command, .shift])
         }
         CommandMenu("Document") {
             Button("Send to Kindle") { if let d = app.selectedDocument { app.sendToKindle(d) } }
@@ -81,6 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesProvider = ServiceProvider()
         NSUpdateDynamicServices()
         LocalServer.shared.start()
+        // Current model ids from our catalog worker (at most once a day).
+        Task { @MainActor in await ModelCatalogStore.shared.refreshIfNeeded() }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

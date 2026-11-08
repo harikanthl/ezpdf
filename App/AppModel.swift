@@ -40,11 +40,24 @@ final class AppModel {
     var renaming: DocumentRecord?
     /// Set to a tab to open Settings there (from ezpdf://settings links).
     var settingsRequest: String?
+    /// The assistant beside the reader; it works on whichever document is open.
+    let assistant = AssistantModel()
+    var showAssistant = UserDefaults.standard.bool(forKey: "ezpdf.showAssistant") {
+        didSet { UserDefaults.standard.set(showAssistant, forKey: "ezpdf.showAssistant") }
+    }
+    /// The templates gallery sheet.
+    var showTemplates = false
+    /// The page the reader shows (1-based), for the assistant's context.
+    var currentPage = 1
 
     private var toastTask: Task<Void, Never>?
 
     init() {
         reload()
+        assistant.context = { [weak self] in
+            guard let self, let doc = self.selectedDocument else { return nil }
+            return (doc.id, doc.title, doc.pageCount, self.currentPage)
+        }
         NotificationCenter.default.addObserver(forName: Library.didChange, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.reload() }
         }

@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import PDFKit
 import EzPDFCore
 
@@ -20,31 +21,40 @@ struct ReaderView: View {
     @State private var busy: String?
     @State private var summary: String?
     @State private var showSummary = false
+    @State private var editTool: EditTool?
+    @State private var placed: (tool: EditTool, page: Int, rect: CGRect)?
+    @State private var showPlacement = false
+    @State private var replacing: (text: String, page: Int)?
+    @State private var showReplace = false
+    @State private var editingObject: ObjectEditSheet.Model?
+    @State private var showHeaderFooter = false
+    @State private var marking = false
+    @State private var showLogoGen = false
+    @State private var dropTargeted = false
+    @State private var strokes: [[CGPoint]] = []
     @FocusState private var searchFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             if showSearch { searchBar }
-            HStack(spacing: 0) {
-                if side != .none, mode == .read {
-                    sidebar(side)
-                        .frame(width: 210)
-                        .transition(reduceMotion ? .opacity : .move(edge: .leading).combined(with: .opacity))
-                    Divider()
-                }
-                ZStack {
-                    PDFViewHost(controller: reader)
-                        .opacity(mode == .read ? 1 : 0)
-                    if mode == .pages {
-                        PagesView(record: record, beforeEdit: { reader.flushAnnotations() })
-                    }
-                }
-            }
+            mainArea
+        }
+        // A native inspector column: resizable, and it gives way properly when the window narrows.
+        .inspector(isPresented: Binding(get: { app.showAssistant }, set: { app.showAssistant = $0 })) {
+            AssistantPanel(chat: app.assistant)
+                .inspectorColumnWidth(min: 280, ideal: 340, max: 520)
         }
         .navigationTitle(record.title)
         .navigationSubtitle(subtitle)
         .toolbar { toolbar }
-        .onAppear { reload(page: app.openPage); app.openPage = nil }
+        .onAppear {
+            reload(page: app.openPage); app.openPage = nil
+            reader.onEditObject = { id, a in
+                editingObject = .init(id: id, isText: a.type == "FreeText", text: a.contents ?? "",
+                                      font: a.font?.fontName ?? ".AppleSystemUIFont", size: Double(a.font?.pointSize ?? 12),
+                                      color: Color(nsColor: (a.type == "FreeText" ? a.fontColor : a.color) ?? .black))
+            }
+        }
         .onChange(of: record.modifiedAt) {
             // Reload only for changes made elsewhere (page edits, agents, undo), not our own saves.
             // load() first merges any pending highlights onto the new version.
@@ -53,7 +63,32 @@ struct ReaderView: View {
         .onChange(of: app.openPage) {
             if let p = app.openPage { withoutAnimation { mode = .read }; reader.goTo(pageNumber: p); app.openPage = nil }
         }
-        .onChange(of: reader.currentPageIndex) { pageField = "\(reader.currentPageIndex + 1)" }
+        // Sending the message uses the mark; clear the strokes then.
+        .onChange(of: app.assistant.mark) { if app.assistant.mark == nil, !strokes.isEmpty { strokes = []; marking = false } }
+        .onChange(of: reader.currentPageIndex) { pageField = "\(reader.currentPageIndex + 1)"; app.currentPage = reader.currentPageIndex + 1 }
+        .sheet(isPresented: $showPlacement) {
+            if let placed {
+                PlacementSheet(tool: placed.tool) { text, size, color, image in applyPlacement(text: text, fontSize: size, color: color, image: image) }
+            }
+        }
+        .sheet(isPresented: $showLogoGen) {
+            LogoGeneratorSheet { data in placeImage(data, atView: nil) }
+        }
+        .sheet(isPresented: $showHeaderFooter) {
+            HeaderFooterSheet { c in
+                reader.flushAnnotations()
+                do { let r = try app.ops.stamp(record.id, c); app.show("Added to \(r.pages) page\(r.pages == 1 ? "" : "s")") }
+                catch { app.show(error.localizedDescription, error: true) }
+            }
+        }
+        .sheet(item: $editingObject) { m in
+            ObjectEditSheet(model: m, onSave: { saveObject($0) }, onDelete: { deleteObject(m.id) })
+        }
+        .sheet(isPresented: $showReplace) {
+            if let replacing {
+                ReplaceSheet(original: replacing.text) { new in replaceSelection(replacing.text, with: new, page: replacing.page) }
+            }
+        }
         .onDisappear { reader.flushAnnotations(); reader.stopSpeaking() }
         .sheet(isPresented: $showSummary) {
             VStack(alignment: .leading, spacing: 12) {
@@ -87,6 +122,55 @@ struct ReaderView: View {
                 Button("") { withoutAnimation { mode = mode == .read ? .pages : .read } }.keyboardShortcut("p", modifiers: [.command, .option])
             }.opacity(0).allowsHitTesting(false)
         }
+    }
+
+    private var mainArea: some View {
+    HStack(spacing: 0) {
+        if side != .none, mode == .read {
+            sidebar(side)
+                .frame(minWidth: 150, idealWidth: 210, maxWidth: 260)
+                .transition(reduceMotion ? .opacity : .move(edge: .leading).combined(with: .opacity))
+            Divider()
+        }
+        documentArea
+            .frame(minWidth: 320)
+    }
+    }
+
+    private var documentArea: some View {
+    ZStack {
+        PDFViewHost(controller: reader)
+            .opacity(mode == .read ? 1 : 0)
+            // Drop a picture (logo, signature, stamp) onto the page to place it there.
+            .onDrop(of: [.image, .fileURL], isTargeted: $dropTargeted) { providers, location in
+                handleImageDrop(providers, at: location)
+            }
+            .overlay {
+                if dropTargeted {
+                    RoundedRectangle(cornerRadius: 8).strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6, 5]))
+                        .padding(6).allowsHitTesting(false).transition(.opacity)
+                }
+            }
+        if mode == .pages {
+            PagesView(record: record, beforeEdit: { reader.flushAnnotations() })
+        }
+        if marking, mode == .read {
+            MarkOverlay(strokes: $strokes, onStrokeEnded: {
+                withAnimation(Motion.outFast) { app.assistant.mark = strokes.isEmpty ? nil : reader.mark(from: strokes) }
+            }, onDone: { stopMarking() })
+            .transition(.opacity)
+        }
+        if let tool = editTool, mode == .read {
+            PlacementOverlay(tool: tool, onRect: { r in
+                guard let p = reader.pageRect(fromView: r) else { return }
+                placed = (tool, p.page, p.rect)
+                withoutAnimation { editTool = nil }
+                if [.box, .whiteout, .redact].contains(tool) { applyPlacement(text: "", fontSize: 12, color: "red", image: nil) }
+                else { showPlacement = true }
+            }, onCancel: { withoutAnimation { editTool = nil } })
+            .transition(.opacity)
+        }
+    }
     }
 
     private var subtitle: String {
@@ -214,6 +298,31 @@ struct ReaderView: View {
                     .disabled(!reader.hasSelection)
                     .help("Highlight selection (⇧⌘H)")
             }
+            Menu {
+                ForEach(EditTool.allCases) { t in
+                    Button { withoutAnimation { mode = .read; editTool = t } } label: { Label(t.rawValue, systemImage: t.symbol) }
+                }
+                Divider()
+                Button {
+                    if let sel = reader.selectionForEdit { replacing = sel; showReplace = true }
+                    else { app.show("Select the text to change first.", error: true) }
+                } label: { Label("Change Selected Text…", systemImage: "character.cursor.ibeam") }
+                Button { showLogoGen = true } label: { Label("Generate Logo or Image…", systemImage: "wand.and.stars") }
+                Button { showHeaderFooter = true } label: { Label("Header, Footer & Page Numbers…", systemImage: "rectangle.topthird.inset.filled") }
+                Button { optimizeFlatten() } label: { Label("Flatten Annotations and Forms", systemImage: "square.3.layers.3d.down.right") }
+            } label: { Image(systemName: "pencil.tip.crop.circle") }
+            .help("Edit: add text, sign, images, boxes, white-out, redact, change text")
+            Button { marking ? stopMarking() : startMarking() } label: {
+                Image(systemName: marking ? "pencil.and.scribble" : "pencil.and.scribble")
+                    .foregroundStyle(marking ? Color.accentColor : Color.primary)
+            }
+            .help("Mark & Talk: draw on the page and say what to change (⇧⌘M)")
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            Button { withAnimation(reduceMotion ? nil : Motion.out) { app.showAssistant.toggle() } } label: {
+                Image(systemName: app.showAssistant ? "sparkles.rectangle.stack.fill" : "sparkles")
+            }
+            .help("Assistant: ask for edits in words or by voice (⌘J)")
+            .keyboardShortcut("j")
             Button { app.extractFor = record } label: { Image(systemName: "tablecells") }
                 .help("Extract transactions, invoice fields or tables")
             Button { app.sendToKindle(record) } label: { Image(systemName: "paperplane") }
@@ -236,8 +345,8 @@ struct ReaderView: View {
             } label: { Image(systemName: "ellipsis.circle") }
             .help("More")
             .popover(isPresented: $showNote, arrowEdge: .bottom) { notePopover }
-            ShareLink(item: Library.shared.pdfURL(for: record.id)) { Image(systemName: "square.and.arrow.up") }
-                .help("Share")
+            Button { shareDeliverable() } label: { Image(systemName: "square.and.arrow.up") }
+                .help("Share (with everything you placed made part of the pages)")
         }
     }
 
@@ -284,6 +393,118 @@ struct ReaderView: View {
             do { summary = try await app.ops.summarize(record.id); showSummary = true }
             catch { app.show(error.localizedDescription, error: true) }
         }
+    }
+
+    /// Pen on: the assistant opens and listens, so you mark and talk at once (like ezRecord's pencil).
+    private func startMarking() {
+        withoutAnimation { mode = .read; editTool = nil; marking = true }
+        strokes = []
+        withAnimation(reduceMotion ? nil : Motion.out) { app.showAssistant = true }
+        app.assistant.startListening()
+    }
+
+    private func stopMarking() {
+        withoutAnimation { marking = false }
+    }
+
+    private func handleImageDrop(_ providers: [NSItemProvider], at point: CGPoint) -> Bool {
+        let imageExts: Set<String> = ["png", "jpg", "jpeg", "heic", "gif", "tif", "tiff", "webp", "svg", "bmp"]
+        for p in providers {
+            if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    guard let url, imageExts.contains(url.pathExtension.lowercased()), let data = try? Data(contentsOf: url) else { return }
+                    Task { @MainActor in placeImage(data, atView: point) }
+                }
+                return true
+            }
+            if p.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                p.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data else { return }
+                    Task { @MainActor in placeImage(data, atView: point) }
+                }
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Puts an image on the page as a movable object: where it was dropped, or near the top left of
+    /// the page being read. Drag it, or its corner dot, to place and size it.
+    private func placeImage(_ data: Data, atView point: CGPoint?) {
+        reader.flushAnnotations()
+        var page = reader.currentPageIndex + 1
+        var rect = CGRect(x: 48, y: 40, width: 110, height: 110)
+        if let point, let p = reader.pageRect(fromView: CGRect(x: point.x - 60, y: point.y - 60, width: 120, height: 120)) {
+            page = p.page; rect = p.rect
+        }
+        do {
+            try app.ops.addContent(record.id, .init(kind: .image, page: page, rect: rect, imageData: data))
+            app.show("Placed. Drag it to move, drag the corner dot to resize.")
+        } catch { app.show(error.localizedDescription, error: true) }
+    }
+
+    private func applyPlacement(text: String, fontSize: Int, color: String, image: Data?) {
+        guard let placed else { return }
+        reader.flushAnnotations()
+        Task {
+            do {
+                switch placed.tool {
+                case .redact:
+                    withAnimation(Motion.out) { busy = "Redacting…" }
+                    defer { withAnimation(Motion.outFast) { busy = nil } }
+                    _ = try await app.ops.redact(record.id, boxes: [(placed.page, placed.rect)])
+                    app.show("Redacted. That area is gone for good (Undo still restores it).")
+                case .text:
+                    try app.ops.addContent(record.id, .init(kind: .text, page: placed.page, rect: placed.rect, text: text,
+                                                            fontSize: CGFloat(fontSize), color: ColorName.parse(color)))
+                case .signature:
+                    try app.ops.addContent(record.id, .init(kind: .signature, page: placed.page, rect: placed.rect, text: text, imageData: image))
+                case .image:
+                    try app.ops.addContent(record.id, .init(kind: .image, page: placed.page, rect: placed.rect, imageData: image))
+                case .box:
+                    try app.ops.addContent(record.id, .init(kind: .shape, page: placed.page, rect: placed.rect, color: .systemRed, shape: .rectangle))
+                case .whiteout:
+                    try app.ops.addContent(record.id, .init(kind: .whiteout, page: placed.page, rect: placed.rect))
+                }
+            } catch { app.show(error.localizedDescription, error: true) }
+            self.placed = nil
+        }
+    }
+
+    private func saveObject(_ m: ObjectEditSheet.Model) {
+        do {
+            _ = try app.ops.updateObject(record.id, object: m.id, .init(
+                text: m.isText ? m.text : nil, fontName: m.isText ? m.font : nil, fontSize: m.isText ? CGFloat(m.size) : nil,
+                color: NSColor(m.color)))
+        } catch { app.show(error.localizedDescription, error: true) }
+    }
+
+    private func deleteObject(_ id: String) {
+        do { _ = try app.ops.deleteObject(record.id, object: id) } catch { app.show(error.localizedDescription, error: true) }
+    }
+
+    private func replaceSelection(_ old: String, with new: String, page: Int) {
+        reader.flushAnnotations()
+        do {
+            let r = try app.ops.replaceText(record.id, find: old, with: new, pages: "\(page)", matchCase: true)
+            app.show("Changed \(r.changes.count) place\(r.changes.count == 1 ? "" : "s") on page \(page)")
+        } catch { app.show(error.localizedDescription, error: true) }
+    }
+
+    private func optimizeFlatten() {
+        reader.flushAnnotations()
+        do { _ = try app.ops.flatten(record.id); app.show("Annotations and form values are now part of the pages") }
+        catch { app.show(error.localizedDescription, error: true) }
+    }
+
+    private func shareDeliverable() {
+        do {
+            let url = try app.ops.deliverableFile(record.id)
+            let picker = NSSharingServicePicker(items: [url])
+            if let view = NSApp.keyWindow?.contentView {
+                picker.show(relativeTo: CGRect(x: view.bounds.maxX - 60, y: view.bounds.maxY - 10, width: 1, height: 1), of: view, preferredEdge: .minY)
+            }
+        } catch { app.show(error.localizedDescription, error: true) }
     }
 
     private func undo() {

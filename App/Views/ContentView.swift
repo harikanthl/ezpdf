@@ -34,6 +34,7 @@ struct ContentView: View {
         .animation(reduceMotion ? nil : Motion.out, value: app.toast)
         .sheet(item: $app.extractFor) { rec in ExtractSheet(record: rec) }
         .sheet(item: $app.renaming) { rec in RenameSheet(record: rec) }
+        .sheet(isPresented: $app.showTemplates) { TemplatesView() }
         .onChange(of: app.settingsRequest) {
             guard let tab = app.settingsRequest else { return }
             settingsTab = tab
@@ -323,6 +324,15 @@ struct EmptyState: View {
     @Environment(AppModel.self) private var app
 
     var body: some View {
+        // Scrolls instead of clipping when the window is short; centered when there's room.
+        GeometryReader { geo in
+            ScrollView {
+                content.frame(minHeight: geo.size.height)
+            }
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: 22) {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -344,12 +354,11 @@ struct EmptyState: View {
                 Text("Anything into a good PDF").font(.title2.weight(.semibold))
                 Text("Paste a link to an article, a paper or a docs page and get a clean PDF and EPUB sized for your Kindle. Drop images, Word files, statements or invoices too.")
                     .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 440)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            HStack(spacing: 10) {
-                Button { app.focusConvertField = true } label: { Label("Paste a Link", systemImage: "link") }
-                    .buttonStyle(PressableStyle(prominent: true))
-                Button { openFiles() } label: { Label("Choose Files…", systemImage: "folder") }
-                    .buttonStyle(PressableStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { heroButtons }
+                VStack(spacing: 8) { heroButtons }
             }
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 6) {
                 hint("⌘L", "Paste a link")
@@ -361,7 +370,17 @@ struct EmptyState: View {
             .padding(.top, 8)
         }
         .padding(40)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity)
+    }
+
+    @ViewBuilder
+    private var heroButtons: some View {
+        Button { app.focusConvertField = true } label: { Label("Paste a Link", systemImage: "link") }
+            .buttonStyle(PressableStyle(prominent: true))
+        Button { app.showTemplates = true } label: { Label("Start from a Template", systemImage: "doc.text.image") }
+            .buttonStyle(PressableStyle())
+        Button { openFiles() } label: { Label("Choose Files…", systemImage: "folder") }
+            .buttonStyle(PressableStyle())
     }
 
     private func hint(_ key: String, _ text: String) -> some View {

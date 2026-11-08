@@ -52,6 +52,8 @@
 	<string>ezpdf uses Mail to send documents to your Kindle.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string></string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ezpdf listens while you talk to the assistant. Speech is turned into text on this Mac.</string>
 	<key>NSServices</key>
 	<array>
 		<dict>
@@ -72,5 +74,7 @@
 			</array>
 		</dict>
 	</array>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>ezpdf turns what you say to the assistant into text, on this Mac.</string>
 </dict>
 </plist>

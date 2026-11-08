@@ -195,13 +195,14 @@ public enum WebConverter {
 
     /// Lays out an article (or any body HTML) for a preset and returns the PDF.
     public static func renderArticle(_ article: Article, preset: PagePreset) async throws -> (pdf: Data, truncated: Bool) {
-        try await renderHTMLBody(article.html, title: article.title, preset: preset, baseURL: article.sourceURL,
+        let r = try await renderHTMLBody(article.html, title: article.title, preset: preset, baseURL: article.sourceURL,
                                  header: ArticleHTML.header(for: article), author: article.byline,
                                  subject: article.sourceURL.absoluteString, lang: article.lang)
+        return (r.pdf, r.truncated)
     }
 
     static func renderHTMLBody(_ body: String, title: String, preset: PagePreset, baseURL: URL?,
-                               header: String, author: String?, subject: String?, lang: String?) async throws -> (pdf: Data, truncated: Bool) {
+                               header: String, author: String?, subject: String?, lang: String?) async throws -> (pdf: Data, truncated: Bool, slices: [Range<Double>]) {
         let p = preset == .web ? PagePreset.letter : preset
         let html = ArticleHTML.document(body: body, header: header, title: title, preset: p, lang: lang)
         let layout = WebSession(width: p.contentSize.width, height: p.contentSize.height, javaScript: false)
