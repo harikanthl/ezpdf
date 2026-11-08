@@ -25,6 +25,8 @@ public enum FormDetector {
         public var name: String
         /// One character per box, this many boxes (0 when it's an ordinary field).
         public var comb: Int = 0
+        /// The line number printed beside it ("1a", "7"), on worksheets and numbered forms.
+        public var number: String? = nil
     }
 
     // MARK: Detecting
@@ -110,7 +112,7 @@ public enum FormDetector {
                 if hit.side == .above, !c.stacked, hit.raw.count > 40, hit.raw.trimmingCharacters(in: .whitespaces).hasSuffix(".") { return nil }
             }
             let label = hit?.text ?? ""
-            return Field(page: index, rect: c.rect, kind: kind(for: c, label: label), label: label, name: "", comb: c.comb)
+            return Field(page: index, rect: c.rect, kind: kind(for: c, label: label), label: label, name: "", comb: c.comb, number: hit?.number)
         }
     }
 
@@ -400,7 +402,7 @@ public enum FormDetector {
     static func cleanLabel(_ s: String, before: Bool) -> String {
         // OCR reads a box in front of a word as a bullet ("•Student").
         var t = s.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "•·▪■□☐◻○◯")))
-        t = t.replacingOccurrences(of: #"^(\(?\d{1,2}[a-z]?[.)]?|[a-z][.)])\s+"#, with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: #"^(\(?\d{1,2}[a-z]?[.)]?|\(?[a-z][.)])\s+"#, with: "", options: .regularExpression)
         if t.count > 40 {
             let sentences = t.components(separatedBy: ". ").filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
             t = (before ? sentences.last : sentences.first) ?? t
@@ -436,6 +438,7 @@ public enum FormDetector {
         var rect: CGRect
         var side: Side
         var lineHeight: CGFloat     // one line of the label (its type size, for telling headings apart)
+        var number: String? = nil   // a line number between the label and the blank ("1a")
     }
 
     static func findLabel(for c: Candidate, in labels: [TextFragment]) -> LabelHit? {
@@ -455,7 +458,10 @@ public enum FormDetector {
                     // Within reach of the blank, or of a number / "$" that sits between them.
                     let between = sameRow.filter { $0.rect.minX >= t.rect.maxX - 1 && $0.rect.maxX <= f.minX + 6 }
                     let start = between.map(\.rect.minX).min() ?? f.minX
-                    return start - t.rect.maxX <= reach && f.minX - t.rect.maxX <= reach + 200 ? hit(t, .left, before: true) : nil
+                    guard start - t.rect.maxX <= reach && f.minX - t.rect.maxX <= reach + 200 else { return nil }
+                    var h = hit(t, .left, before: true)
+                    h.number = between.sorted { $0.rect.maxX > $1.rect.maxX }.lazy.compactMap { lineNumber($0.text) }.first
+                    return h
                 }
         }
         if c.checkbox {
@@ -513,18 +519,48 @@ public enum FormDetector {
         return c.rect.height >= 30 ? .multiline : .text
     }
 
-    /// Field names from labels ("Full name:" → full_name), unique in the document, in reading order.
+    /// A printed line number like "1a", "7", "(3)", "4(b)", or nil.
+    static func lineNumber(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let m = t.range(of: #"^\(?(\d{1,2})\)?\s?\(?([a-z])?\)?\.?$"#, options: .regularExpression), m.lowerBound == t.startIndex else { return nil }
+        let kept = t.filter { $0.isNumber || $0.isLetter }
+        return kept.isEmpty ? nil : kept
+    }
+
+    /// Words that don't tell fields apart ("Enter the amount from line 3 here").
+    static let fillerWords: Set<String> = [
+        "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "from", "by", "with", "at", "as", "is", "are", "be", "was",
+        "were", "if", "then", "than", "this", "that", "these", "those", "your", "you", "yours", "my", "our", "their", "it", "its",
+        "into", "over", "under", "up", "down", "out", "per", "each", "any", "all", "also", "not", "no", "do", "does", "here", "there",
+        "enter", "add", "subtract", "multiply", "divide", "skip", "include", "including", "check", "write", "print", "fill", "complete",
+        "amount", "amounts", "line", "lines", "page", "step", "see", "instructions", "result", "results", "otherwise", "only", "may",
+        "must", "can", "will", "should", "optional", "applicable", "below", "above", "following", "etc", "e", "g", "i",
+    ]
+
+    /// A short field name from a label: its first few telling words (at most 4, about 32 characters),
+    /// with the printed line number in front when there is one ("line_1b_qualified_overtime").
+    static func shortName(label: String, number: String?) -> String {
+        let words = label.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        // In a short label a single letter can matter ("C corporation", "S corporation"); in a sentence it's noise.
+        let short = words.count <= 4
+        let telling = words.filter { w in
+            !fillerWords.contains(w) && !w.allSatisfy(\.isNumber) && lineNumber(w) == nil      // "2a": a reference to another line
+                && (w.count > 1 || short && w.first?.isLetter == true)
+        }
+        var kept: [String] = []
+        for w in telling.prefix(4) where (kept + [w]).joined(separator: "_").count <= 32 { kept.append(w) }
+        // Nothing telling ("Enter the result here"): the line number, or the caller's plain name.
+        let base = kept.joined(separator: "_")
+        guard let number else { return base }
+        return base.isEmpty ? "line_\(number)" : "line_\(number)_\(base)"
+    }
+
+    /// Field names, unique in the document, in reading order.
     static func named(_ fields: [Field]) -> [Field] {
         var seen: [String: Int] = [:]
         return fields.sorted { ($0.page, ($0.rect.minY / 4).rounded(), $0.rect.minX) < ($1.page, ($1.rect.minY / 4).rounded(), $1.rect.minX) }.map { f in
             var f = f
-            var base = f.label.lowercased().replacingOccurrences(of: #"[^a-z0-9]+"#, with: "_", options: .regularExpression)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-            if base.count > 40 {
-                // At a word break, not mid-word.
-                let head = String(base.prefix(41))
-                base = head.lastIndex(of: "_").map { String(head[..<$0]) } ?? String(base.prefix(40))
-            }
+            var base = shortName(label: f.label, number: f.number)
             if base.isEmpty { base = f.kind == .checkbox ? "checkbox" : "field" }
             let n = (seen[base] ?? 0) + 1
             seen[base] = n

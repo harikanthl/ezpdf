@@ -183,3 +183,18 @@ func flatForm() -> Data {
         #expect(t.rows[1].contains("11.00"))
     }
 }
+
+@Suite struct FieldNameTests {
+    @Test func shortTellingNames() {
+        #expect(FormDetector.shortName(label: "First name and middle initial", number: nil) == "first_name_middle_initial")
+        #expect(FormDetector.shortName(label: "C corporation", number: nil) == "c_corporation")
+        #expect(FormDetector.shortName(label: "S corporation", number: nil) == "s_corporation")
+        #expect(FormDetector.shortName(label: "Enter the result here", number: "3") == "line_3")
+        #expect(FormDetector.shortName(label: "Add lines 2a and 2b and enter the result", number: "2c") == "line_2c")
+        #expect(FormDetector.shortName(label: "Your qualified overtime compensation, up to $12,500 ($25,000 if married filing jointly)", number: "1b")
+                == "line_1b_qualified_overtime_compensation")
+        #expect(FormDetector.shortName(label: "Enter the result here", number: nil).isEmpty)
+        #expect(FormDetector.lineNumber("(3)") == "3" && FormDetector.lineNumber("4(b)") == "4b" && FormDetector.lineNumber("1a.") == "1a")
+        #expect(FormDetector.lineNumber("Total") == nil && FormDetector.lineNumber("123") == nil)
+    }
+}
