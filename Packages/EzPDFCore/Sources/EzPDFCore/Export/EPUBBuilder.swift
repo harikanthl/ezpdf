@@ -33,33 +33,42 @@ enum EPUBBuilder {
 
     struct Image { let name: String; let mediaType: String; let data: Data }
 
+    /// Downloads article images: redirects re-checked, 6 at a time, 15 MB each, 150 MB in total.
     static func downloadImages(_ srcs: [String], allowLocal: Bool) async -> [String: Image] {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 20
-        config.httpAdditionalHeaders = ["User-Agent": WebSession.userAgent]
-        let session = URLSession(configuration: config)
-        defer { session.finishTasksAndInvalidate() }
-
-        return await withTaskGroup(of: (String, Image?).self) { group in
-            for (i, src) in srcs.enumerated() {
-                group.addTask {
-                    let data: Data?
-                    if src.hasPrefix("data:") {
-                        data = Self.decodeDataURL(src)
-                    } else if let url = URL(string: src), URLGuard.isAllowed(url, allowLocal: allowLocal) {
-                        data = try? await session.data(from: url).0
-                    } else {
-                        data = nil
+        let dl = GuardedDownload(allowLocal: allowLocal)
+        defer { dl.finish() }
+        var out: [String: Image] = [:]
+        var total = 0
+        let items = Array(srcs.enumerated())
+        for batchStart in stride(from: 0, to: items.count, by: 6) {
+            let batch = items[batchStart..<min(batchStart + 6, items.count)]
+            let results = await withTaskGroup(of: (String, Image?).self) { group in
+                for (i, src) in batch {
+                    group.addTask {
+                        let data: Data?
+                        if src.hasPrefix("data:") {
+                            data = src.utf8.count < 20_000_000 ? Self.decodeDataURL(src) : nil
+                        } else if let url = URL(string: src) {
+                            if case .data(let d, _)? = try? await dl.fetch(url, maxBytes: 15_000_000) { data = d } else { data = nil }
+                        } else {
+                            data = nil
+                        }
+                        guard let data, !data.isEmpty, let img = Self.normalize(data, index: i) else { return (src, nil) }
+                        return (src, img)
                     }
-                    guard let data, data.count > 0, data.count < 15_000_000,
-                          let img = Self.normalize(data, index: i) else { return (src, nil) }
-                    return (src, img)
                 }
+                var r: [(String, Image?)] = []
+                for await x in group { r.append(x) }
+                return r
             }
-            var out: [String: Image] = [:]
-            for await (src, img) in group { if let img { out[src] = img } }
-            return out
+            for (src, img) in results {
+                guard let img else { continue }
+                total += img.data.count
+                if total > 150_000_000 { return out }
+                out[src] = img
+            }
         }
+        return out
     }
 
     nonisolated static func decodeDataURL(_ s: String) -> Data? {

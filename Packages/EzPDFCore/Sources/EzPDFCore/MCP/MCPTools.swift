@@ -34,7 +34,7 @@ enum MCPTools {
                         "format": S.string("pdf, epub or both (default both)", enum: ["pdf", "epub", "both"]),
                         "title": S.string("Optional title to use instead of the page's"),
                     ], required: ["url"]),
-                    readOnly: false, openWorld: true) { a in
+                    readOnly: false, openWorld: true) { a, ctx in
                 guard let url = URL(string: try a.need("url")), url.scheme?.hasPrefix("http") == true else { throw EzPDFError.invalidInput("Give an http(s) URL.") }
                 let rec = try await ops.convert(url: url, preset: PagePreset.parse(a.str("preset")), format: OutputFormat.parse(a.str("format")),
                                                 title: a.str("title"), source: .agent)
@@ -43,23 +43,27 @@ enum MCPTools {
             },
 
             MCPTool(name: "convert_file", title: "Make a PDF from a file",
-                    description: "Convert files on this Mac (images, Word, RTF, Markdown, text, HTML, CSV, or a PDF to import) into one PDF in the library. Pass paths, or file bytes as base64 with a file name.",
+                    description: "Convert files (images, Word, RTF, Markdown, text, HTML, CSV, or a PDF to import) into one PDF in the library. Send file bytes as base64 with a file name. Local agents may instead pass paths inside the user's Downloads, Desktop or Documents folders.",
                     schema: S.object([
-                        "paths": S.strings("Absolute file paths on the Mac; several are combined in order"),
+                        "paths": S.strings("Local agents only: absolute paths inside ~/Downloads, ~/Desktop or ~/Documents; several are combined in order"),
                         "content_base64": S.string("File bytes as base64 (alternative to paths, max 20 MB)"),
                         "file_name": S.string("File name with extension, required with content_base64"),
                         "preset": S.string("Page size", enum: presetValues),
                         "title": S.string("Optional title"),
                     ]),
-                    readOnly: false) { a in
+                    readOnly: false) { a, ctx in
                 let preset = PagePreset.parse(a.str("preset"))
                 let rec: DocumentRecord
                 if let b64 = a.str("content_base64") {
                     guard let data = Data(base64Encoded: b64, options: .ignoreUnknownCharacters) else { throw EzPDFError.invalidInput("content_base64 isn't valid base64.") }
                     rec = try await ops.convert(data: data, fileName: try a.need("file_name"), preset: preset)
                 } else {
-                    let paths = (a["paths"] as? [String] ?? []).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
-                    guard !paths.isEmpty else { throw EzPDFError.invalidInput("Give paths or content_base64.") }
+                    guard !ctx.isRemote else {
+                        throw EzPDFError.invalidInput("Remote callers can't read files on this Mac. Send the file as content_base64 instead.")
+                    }
+                    let raw = (a["paths"] as? [String] ?? []).prefix(50)
+                    guard !raw.isEmpty else { throw EzPDFError.invalidInput("Give paths or content_base64.") }
+                    let paths = try raw.map { try FileAccess.checkedAgentPath($0) }
                     rec = try await ops.convert(files: paths, preset: preset, title: a.str("title"), source: .agent)
                 }
                 return ToolOutput(text: "Saved \(line(rec)).", structured: doc(rec))
@@ -72,8 +76,8 @@ enum MCPTools {
                         "kind": S.string("web, file, statement, invoice, merged or imported", enum: ["web", "file", "statement", "invoice", "merged", "imported"]),
                         "limit": S.int("Max results (default 25)"),
                     ]),
-                    readOnly: true, idempotent: true) { a in
-                let docs = ops.list(query: a.str("query"), kind: a.str("kind").flatMap(DocumentRecord.Kind.init), limit: a.int("limit") ?? 25)
+                    readOnly: true, idempotent: true) { a, ctx in
+                let docs = ops.list(query: a.str("query"), kind: a.str("kind").flatMap(DocumentRecord.Kind.init), limit: a.int("limit", in: 1...200) ?? 25)
                 let text = docs.isEmpty ? "No documents match." : docs.map { "• " + line($0) }.joined(separator: "\n")
                 return ToolOutput(text: text, structured: ["documents": docs.map(doc)])
             },
@@ -81,7 +85,7 @@ enum MCPTools {
             MCPTool(name: "get_document", title: "Document details",
                     description: "Details of one document: title, source, page count, and its table of contents with page numbers.",
                     schema: S.object(["id": S.string("Document id or title")], required: ["id"]),
-                    readOnly: true, idempotent: true) { a in
+                    readOnly: true, idempotent: true) { a, ctx in
                 let rec = try ops.record(try a.need("id"))
                 let outline = try ops.outline(rec.id)
                 var d = doc(rec)
@@ -97,8 +101,8 @@ enum MCPTools {
                         "pages": S.string("Page range, e.g. 1-5 or 2,4,9-. Default all"),
                         "max_chars": S.int("Cap on characters returned (default 40000)"),
                     ], required: ["id"]),
-                    readOnly: true, idempotent: true) { a in
-                let r = try await ops.text(try a.need("id"), pages: a.str("pages"), maxChars: a.int("max_chars") ?? 40_000)
+                    readOnly: true, idempotent: true) { a, ctx in
+                let r = try await ops.text(try a.need("id"), pages: a.str("pages"), maxChars: a.int("max_chars", in: 500...200_000) ?? 40_000)
                 let tail = r.truncated ? "\n\n[Truncated after page \(r.pages.last ?? 0). Ask for later pages with “pages”.]" : ""
                 return ToolOutput(text: r.text + tail, structured: ["pages_returned": r.pages, "truncated": r.truncated])
             },
@@ -110,26 +114,23 @@ enum MCPTools {
                         "id": S.string("Limit to one document (id or title)"),
                         "limit": S.int("Max hits (default 30)"),
                     ], required: ["query"]),
-                    readOnly: true, idempotent: true) { a in
-                let hits = try ops.search(try a.need("query"), in: a.str("id"), limit: a.int("limit") ?? 30)
+                    readOnly: true, idempotent: true) { a, ctx in
+                let hits = try await ops.search(try a.need("query"), in: a.str("id"), limit: a.int("limit", in: 1...200) ?? 30)
                 let text = hits.isEmpty ? "No matches." : hits.map { "• \($0.title) p\($0.page): …\($0.snippet)…" }.joined(separator: "\n")
                 return ToolOutput(text: text, structured: ["hits": hits.map { ["id": $0.id, "title": $0.title, "page": $0.page, "snippet": $0.snippet] }])
             },
 
             MCPTool(name: "extract_data", title: "Extract statement / invoice data",
-                    description: "Pull structured data out of a PDF: bank or credit-card statement → transactions (checked against the running balance); invoice or receipt → vendor, number, dates, totals and line items; anything else → tables. Runs on the Mac (on-device Apple Intelligence when available). Optionally saves CSV or Excel to the Downloads folder.",
+                    description: "Pull structured data out of a PDF: bank or credit-card statement → transactions (checked against the running balance); invoice or receipt → vendor, number, dates, totals and line items; anything else → tables. Runs on the Mac (on-device Apple Intelligence when available). Read-only; use export_file with format csv or xlsx to save a spreadsheet.",
                     schema: S.object([
                         "id": S.string("Document id or title"),
                         "kind": S.string("auto (default), statement, invoice or tables", enum: ["auto", "statement", "invoice", "tables"]),
-                        "save_as": S.string("Also save a file: csv or xlsx", enum: ["csv", "xlsx", "json"]),
                         "max_rows": S.int("Rows to return inline (default 200)"),
                     ], required: ["id"]),
-                    readOnly: true, idempotent: true) { a in
+                    readOnly: true, idempotent: true) { a, ctx in
                 let id = try a.need("id")
-                let result = try await ops.extract(id, kind: ExtractKind.parse(a.str("kind")), source: .agent)
-                var saved: URL?
-                if let f = a.str("save_as").flatMap(EzPDF.DataFormat.init) { saved = try ops.saveExtraction(result, for: id, format: f) }
-                return summarize(result, maxRows: a.int("max_rows") ?? 200, saved: saved)
+                let result = try await ops.extract(id, kind: ExtractKind.parse(a.str("kind")), source: .agent, remember: false)
+                return summarize(result, maxRows: a.int("max_rows", in: 1...2000) ?? 200, saved: nil)
             },
 
             MCPTool(name: "edit_pages", title: "Edit pages",
@@ -143,10 +144,11 @@ enum MCPTools {
                         "every": S.int("split: pages per part"),
                         "start_pages": S.ints("split: 1-based pages where new parts begin"),
                     ], required: ["id", "action"]),
-                    readOnly: false, destructive: true) { a in
+                    readOnly: false, destructive: true) { a, ctx in
                 guard let action = a.str("action").flatMap(EzPDF.PageAction.init) else { throw EzPDFError.invalidInput("Unknown action.") }
-                let r = try ops.pages(try a.need("id"), action: action, pages: a.str("pages"), degrees: a.int("degrees") ?? 90,
-                                      to: a.int("to"), every: a.int("every"), startPages: a["start_pages"] as? [Int])
+                let r = try ops.pages(try a.need("id"), action: action, pages: a.str("pages"), degrees: a.int("degrees", in: -270...270) ?? 90,
+                                      to: a.int("to", in: 1...100_000), every: a.int("every", in: 1...100_000),
+                                      startPages: (a["start_pages"] as? [NSNumber])?.prefix(1000).map { max(1, min(100_000, $0.intValue)) })
                 let text = r.created.isEmpty ? "Done. \(line(r.document))." : "Created:\n" + r.created.map { "• " + line($0) }.joined(separator: "\n")
                 return ToolOutput(text: text, structured: ["document": doc(r.document), "created": r.created.map(doc)])
             },
@@ -154,7 +156,7 @@ enum MCPTools {
             MCPTool(name: "merge_documents", title: "Merge",
                     description: "Combine documents, in the order given, into a new document.",
                     schema: S.object(["ids": S.strings("Document ids or titles, in order"), "title": S.string("Title for the result")], required: ["ids"]),
-                    readOnly: false) { a in
+                    readOnly: false) { a, ctx in
                 let rec = try ops.merge(a["ids"] as? [String] ?? [], title: a.str("title"))
                 return ToolOutput(text: "Merged into \(line(rec)).", structured: doc(rec))
             },
@@ -167,7 +169,7 @@ enum MCPTools {
                         "password": S.string("protect / unlock: the password"),
                         "text": S.string("watermark: the text"),
                     ], required: ["id", "action"]),
-                    readOnly: false, destructive: true) { a in
+                    readOnly: false, destructive: true) { a, ctx in
                 guard let action = a.str("action").flatMap(EzPDF.Optimization.init) else { throw EzPDFError.invalidInput("Unknown action.") }
                 let r = try await ops.optimize(try a.need("id"), action, password: a.str("password"), text: a.str("text"))
                 let size = action == .compress || action == .compress_strong
@@ -184,11 +186,11 @@ enum MCPTools {
                         "page": S.int("note: 1-based page"),
                         "pages": S.string("highlight: only these pages"),
                     ], required: ["id", "action", "text"]),
-                    readOnly: false) { a in
+                    readOnly: false) { a, ctx in
                 let id = try a.need("id"), text = try a.need("text")
                 if a.str("action") == "note" {
-                    let rec = try ops.addNote(id, page: a.int("page") ?? 1, text: text)
-                    return ToolOutput(text: "Added a note to page \(a.int("page") ?? 1) of “\(rec.title)”.", structured: doc(rec))
+                    let rec = try ops.addNote(id, page: a.int("page", in: 1...100_000) ?? 1, text: text)
+                    return ToolOutput(text: "Added a note to page \(a.int("page", in: 1...100_000) ?? 1) of “\(rec.title)”.", structured: doc(rec))
                 }
                 let r = try ops.highlight(id, text: text, pages: a.str("pages"))
                 return ToolOutput(text: "Highlighted \(r.count) place\(r.count == 1 ? "" : "s") in “\(r.record.title)”.", structured: doc(r.record))
@@ -197,25 +199,35 @@ enum MCPTools {
             MCPTool(name: "send_to_kindle", title: "Send to Kindle",
                     description: "Email a document to the user's Kindle (address set in ezpdf Settings). Uses the EPUB when there is one, since Kindle reflows it; otherwise the PDF.",
                     schema: S.object(["id": S.string("Document id or title"), "format": S.string("Force pdf or epub", enum: ["pdf", "epub"])], required: ["id"]),
-                    readOnly: false, openWorld: true) { a in
-                let r = try ops.sendToKindle(try a.need("id"), format: a.str("format").flatMap(EzPDF.ExportFormat.init))
+                    readOnly: false, openWorld: true) { a, ctx in
+                let r = try await ops.sendToKindle(try a.need("id"), format: a.str("format").flatMap(EzPDF.ExportFormat.init))
                 return ToolOutput(text: "Sent “\(r.record.title)” as \(r.format.rawValue.uppercased()) to \(r.address). It usually appears on the Kindle within a few minutes.", structured: doc(r.record))
             },
 
             MCPTool(name: "export_file", title: "Save a copy",
-                    description: "Save a copy of the PDF or EPUB to a folder on the Mac (default Downloads) and return its path.",
-                    schema: S.object(["id": S.string("Document id or title"), "format": S.string("pdf (default) or epub", enum: ["pdf", "epub"]),
-                                      "folder": S.string("Absolute folder path")], required: ["id"]),
-                    readOnly: false) { a in
-                let url = try ops.export(try a.need("id"), format: a.str("format").flatMap(EzPDF.ExportFormat.init) ?? .pdf,
-                                         folder: a.str("folder").map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) })
+                    description: "Save the PDF or EPUB, or the extracted data as a spreadsheet (csv, xlsx or json), to the user's ezpdf export folder (Downloads unless changed) and return its path.",
+                    schema: S.object(["id": S.string("Document id or title"),
+                                      "format": S.string("pdf (default), epub, or csv/xlsx/json for extracted data", enum: ["pdf", "epub", "csv", "xlsx", "json"]),
+                                      "kind": S.string("For csv/xlsx/json: auto, statement, invoice or tables", enum: ["auto", "statement", "invoice", "tables"]),
+                                      "subfolder": S.string("Optional folder name inside the export folder")], required: ["id"]),
+                    readOnly: false) { a, ctx in
+                let id = try a.need("id")
+                let folder = try a.str("subfolder").map { try FileAccess.exportSubfolder($0, in: ops.exportFolder) }
+                let format = a.str("format") ?? "pdf"
+                let url: URL
+                if let data = EzPDF.DataFormat(rawValue: format) {
+                    let result = try await ops.extract(id, kind: ExtractKind.parse(a.str("kind")), source: .agent)
+                    url = try ops.saveExtraction(result, for: id, format: data, folder: folder)
+                } else {
+                    url = try ops.export(id, format: EzPDF.ExportFormat(rawValue: format) ?? .pdf, folder: folder)
+                }
                 return ToolOutput(text: "Saved to \(url.path)", structured: ["path": url.path])
             },
 
             MCPTool(name: "get_pdf", title: "Get the PDF file",
                     description: "Return the PDF itself (embedded, base64) so you can read or attach it. Limited to 4 MB; use pages to send part of a large document, or export_file to save it on the Mac.",
                     schema: S.object(["id": S.string("Document id or title"), "pages": S.string("Only these pages, e.g. 1-10")], required: ["id"]),
-                    readOnly: true, idempotent: true) { a in
+                    readOnly: true, idempotent: true) { a, ctx in
                 let id = try a.need("id")
                 let rec = try ops.record(id)
                 let data = try ops.pdfData(id, pages: a.str("pages"))
@@ -235,10 +247,10 @@ enum MCPTools {
                         "title": S.string("rename: new title"),
                         "page": S.int("open: 1-based page"),
                     ], required: ["id", "action"]),
-                    readOnly: false, destructive: true) { a in
+                    readOnly: false, destructive: true) { a, ctx in
                 let id = try a.need("id")
                 switch a.str("action") {
-                case "open": let r = try ops.requestOpen(id, page: a.int("page")); return ToolOutput(text: "Opened “\(r.title)” in ezpdf.", structured: doc(r))
+                case "open": let r = try ops.requestOpen(id, page: a.int("page", in: 1...100_000)); return ToolOutput(text: "Opened “\(r.title)” in ezpdf.", structured: doc(r))
                 case "rename": let r = try ops.rename(id, title: try a.need("title")); return ToolOutput(text: "Renamed to “\(r.title)”.", structured: doc(r))
                 case "undo_last_edit": let r = try ops.undo(id); return ToolOutput(text: "Restored the previous version of “\(r.title)”.", structured: doc(r))
                 case "delete": let r = try ops.delete(id); return ToolOutput(text: "Moved “\(r.title)” to the Trash.", structured: ["id": r.id])

@@ -29,35 +29,38 @@ public struct ZipWriter {
         if compress, data.count > 64, let d = Self.deflate(data), d.count < data.count {
             method = 8; body = d
         }
-        let offset = UInt32(out.count)
+        let offset = UInt32(truncatingIfNeeded: out.count)
         out.append(le32(0x04034b50))
         out.append(le16(20)); out.append(le16(0x0800))    // version, flags (UTF-8 names)
         out.append(le16(method)); out.append(le16(dosTime)); out.append(le16(dosDate))
-        out.append(le32(crc)); out.append(le32(UInt32(body.count))); out.append(le32(UInt32(data.count)))
-        out.append(le16(UInt16(name.count))); out.append(le16(0))
+        out.append(le32(crc)); out.append(le32(UInt32(truncatingIfNeeded: body.count))); out.append(le32(UInt32(truncatingIfNeeded: data.count)))
+        out.append(le16(UInt16(truncatingIfNeeded: name.count))); out.append(le16(0))
         out.append(name); out.append(body)
-        entries.append(Entry(name: name, crc: crc, method: method, compSize: UInt32(body.count), size: UInt32(data.count), offset: offset))
+        entries.append(Entry(name: name, crc: crc, method: method, compSize: UInt32(truncatingIfNeeded: body.count), size: UInt32(truncatingIfNeeded: data.count), offset: offset))
     }
 
     public mutating func add(_ path: String, _ text: String, compress: Bool = true) {
         add(path, Data(text.utf8), compress: compress)
     }
 
-    public func finish() -> Data {
-        var data = out
-        let cdStart = UInt32(data.count)
+    /// Builds the central directory in place (no copy of the archive). Inputs ezpdf writes stay far
+    /// below ZIP's 4 GB / 65,535-entry limits; values are truncated rather than trapping if not.
+    public mutating func finish() -> Data {
+        var data = Data()
+        swap(&data, &out)
+        let cdStart = UInt32(truncatingIfNeeded: data.count)
         for e in entries {
             data.append(le32(0x02014b50))
             data.append(le16(20)); data.append(le16(20)); data.append(le16(0x0800))
             data.append(le16(e.method)); data.append(le16(dosTime)); data.append(le16(dosDate))
             data.append(le32(e.crc)); data.append(le32(e.compSize)); data.append(le32(e.size))
-            data.append(le16(UInt16(e.name.count))); data.append(le16(0)); data.append(le16(0))
+            data.append(le16(UInt16(truncatingIfNeeded: e.name.count))); data.append(le16(0)); data.append(le16(0))
             data.append(le16(0)); data.append(le16(0)); data.append(le32(0)); data.append(le32(e.offset))
             data.append(e.name)
         }
-        let cdSize = UInt32(data.count) - cdStart
+        let cdSize = UInt32(truncatingIfNeeded: data.count) &- cdStart
         data.append(le32(0x06054b50)); data.append(le16(0)); data.append(le16(0))
-        data.append(le16(UInt16(entries.count))); data.append(le16(UInt16(entries.count)))
+        data.append(le16(UInt16(truncatingIfNeeded: entries.count))); data.append(le16(UInt16(truncatingIfNeeded: entries.count)))
         data.append(le32(cdSize)); data.append(le32(cdStart)); data.append(le16(0))
         return data
     }

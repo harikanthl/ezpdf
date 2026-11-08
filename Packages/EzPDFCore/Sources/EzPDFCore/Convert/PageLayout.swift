@@ -54,30 +54,74 @@ enum PageLayout {
     /// Longest document we'll paginate (about 250 Kindle pages); beyond this the rest is cut.
     static let maxContentHeight: Double = 150_000
 
+    /// Renders the session's page into fixed-size PDF pages. Each slice is drawn into the output
+    /// as soon as it's captured and then dropped, so memory stays flat on long documents.
+    /// `truncated` is true when the content was longer than ezpdf keeps.
     static func renderPDF(session: WebSession, pageSize: CGSize, margin: CGFloat,
-                          contentWidth: CGFloat, metadata: Metadata) async throws -> Data {
+                          contentWidth: CGFloat, metadata: Metadata) async throws -> (pdf: Data, truncated: Bool) {
         let json = try await session.jsString(measureJS, timeout: 60)
-        guard let measure = try? JSONDecoder().decode(Measure.self, from: Data(json.utf8)) else {
+        guard let measure = try? JSONDecoder().decode(Measure.self, from: Data(json.utf8)), measure.height.isFinite, measure.height > 0 else {
             throw EzPDFError.failed("Couldn't measure the page layout.")
         }
+        let truncated = measure.height > maxContentHeight
         let contentHeight = min(measure.height, maxContentHeight)
         let boxes = measure.boxes.compactMap { b -> Paginator.Box? in
-            guard b.count == 3, let kind = Paginator.Box.Kind(rawValue: Int(b[2])) else { return nil }
+            guard b.count == 3, b[0].isFinite, b[1].isFinite, let kind = Paginator.Box.Kind(rawValue: Int(b[2])) else { return nil }
             return Paginator.Box(top: b[0], bottom: b[1], kind: kind)
         }
         let pageContentHeight = Double(pageSize.height - margin * 2)
         let slices = Paginator.slices(contentHeight: contentHeight, pageHeight: pageContentHeight, boxes: boxes)
         guard !slices.isEmpty else { throw EzPDFError.failed("The page has no content to print.") }
 
-        var sliceData: [Data] = []
-        sliceData.reserveCapacity(slices.count)
+        let writer = try PageWriter(pageSize: pageSize, margin: margin)
         for s in slices {
             let rect = CGRect(x: 0, y: s.lowerBound, width: Double(contentWidth), height: s.upperBound - s.lowerBound)
-            sliceData.append(try await session.pdf(rect: rect))
+            let slice = try await session.pdf(rect: rect)
+            writer.draw(slice)
         }
-        let composed = try compose(slices: sliceData, pageSize: pageSize, margin: margin)
-        return finish(composed, slices: slices, headings: measure.headings, pageSize: pageSize,
-                      margin: margin, metadata: metadata)
+        let composed = writer.finish()
+        return (finish(composed, slices: slices, headings: measure.headings, pageSize: pageSize,
+                       margin: margin, metadata: metadata), truncated)
+    }
+
+    /// Streams slices onto pages of one PDF.
+    final class PageWriter {
+        let out = NSMutableData()
+        let ctx: CGContext
+        let pageSize: CGSize
+        let margin: CGFloat
+
+        init(pageSize: CGSize, margin: CGFloat) throws {
+            self.pageSize = pageSize
+            self.margin = margin
+            var mediaBox = CGRect(origin: .zero, size: pageSize)
+            guard let consumer = CGDataConsumer(data: out as CFMutableData),
+                  let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+                throw EzPDFError.failed("Couldn't create the PDF.")
+            }
+            self.ctx = ctx
+        }
+
+        func draw(_ data: Data) {
+            ctx.beginPDFPage(nil)
+            if let provider = CGDataProvider(data: data as CFData), let doc = CGPDFDocument(provider), let page = doc.page(at: 1) {
+                let r = page.getBoxRect(.mediaBox)
+                let available = pageSize.width - margin * 2
+                let scale = r.width > available ? available / r.width : 1
+                ctx.saveGState()
+                ctx.translateBy(x: margin, y: pageSize.height - margin - r.height * scale)
+                ctx.scaleBy(x: scale, y: scale)
+                ctx.translateBy(x: -r.minX, y: -r.minY)
+                ctx.drawPDFPage(page)
+                ctx.restoreGState()
+            }
+            ctx.endPDFPage()
+        }
+
+        func finish() -> Data {
+            ctx.closePDF()
+            return out as Data
+        }
     }
 
     /// Draws each captured slice at the top of a fixed-size page. Vector content and

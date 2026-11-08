@@ -4,6 +4,8 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(AppModel.self) private var app
+    @Environment(\.openSettings) private var openSettings
+    @AppStorage("ezpdf.settingsTab") private var settingsTab = "general"
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var dropping = false
 
@@ -32,6 +34,12 @@ struct ContentView: View {
         .animation(reduceMotion ? nil : Motion.out, value: app.toast)
         .sheet(item: $app.extractFor) { rec in ExtractSheet(record: rec) }
         .sheet(item: $app.renaming) { rec in RenameSheet(record: rec) }
+        .onChange(of: app.settingsRequest) {
+            guard let tab = app.settingsRequest else { return }
+            settingsTab = tab
+            app.settingsRequest = nil
+            openSettings()
+        }
     }
 }
 
@@ -77,7 +85,58 @@ struct LibrarySidebar: View {
                     Text("Your PDFs will appear here.").font(.callout).foregroundStyle(.tertiary)
                 }
             }
+            SidebarFooter()
         }
+    }
+}
+
+/// Settings and Help, always one click away, plus a quiet status of the agent server.
+struct SidebarFooter: View {
+    @Environment(\.openSettings) private var openSettings
+    @AppStorage("ezpdf.settingsTab") private var settingsTab = SettingsTab.general.rawValue
+    @State private var server = LocalServer.shared
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 2) {
+                Button { open(.general) } label: { Label("Settings", systemImage: "gearshape") }
+                    .help("Settings (⌘,)")
+                Button { open(.help) } label: { Label("Help", systemImage: "questionmark.circle") }
+                    .help("How to use ezpdf")
+                Spacer()
+                Button { open(.agents) } label: {
+                    HStack(spacing: 5) {
+                        Circle().fill(server.isRunning ? Color.green : Color.orange).frame(width: 6, height: 6)
+                        Text("Agents").font(.caption)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .help(server.isRunning ? "Agents can connect at \(server.mcpURL)" : (server.lastError ?? "Agent server is off"))
+            }
+            .buttonStyle(FooterButtonStyle())
+            .padding(.horizontal, 8).padding(.vertical, 6)
+        }
+    }
+
+    private func open(_ tab: SettingsTab) {
+        settingsTab = tab.rawValue
+        openSettings()
+    }
+}
+
+struct FooterButtonStyle: ButtonStyle {
+    @State private var hover = false
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.callout)
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 8).frame(height: 26)
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(hover ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear)))
+            .contentShape(Rectangle())
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(Motion.press, value: configuration.isPressed)
+            .onHover { hover = $0 }
     }
 }
 
@@ -276,14 +335,14 @@ struct EmptyState: View {
                     .fill(Color.white)
                     .frame(width: 84, height: 108)
                     .shadow(color: .black.opacity(0.22), radius: 12, y: 6)
-                    .overlay(Image(systemName: "arrow.down.doc").font(.system(size: 30, weight: .light)).foregroundStyle(Color.accentColor))
+                    .overlay(Image("LogoMark").resizable().interpolation(.high).aspectRatio(contentMode: .fit).padding(14))
                     .rotationEffect(.degrees(4))
                     .offset(x: 12)
             }
             .padding(.bottom, 4)
             VStack(spacing: 6) {
                 Text("Anything into a good PDF").font(.title2.weight(.semibold))
-                Text("Paste a link — an article, a paper, a docs page — and get a clean PDF and EPUB sized for your Kindle. Drop images, Word files, statements or invoices too.")
+                Text("Paste a link to an article, a paper or a docs page and get a clean PDF and EPUB sized for your Kindle. Drop images, Word files, statements or invoices too.")
                     .multilineTextAlignment(.center).foregroundStyle(.secondary).frame(maxWidth: 440)
             }
             HStack(spacing: 10) {

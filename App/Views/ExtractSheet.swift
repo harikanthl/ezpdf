@@ -139,7 +139,7 @@ struct ExtractSheet: View {
         let tsv = result.csvRows.map { $0.joined(separator: "\t") }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(tsv, forType: .string)
-        app.show("Copied — paste into Numbers or Excel")
+        app.show("Copied. Paste it into Numbers or Excel")
     }
 }
 

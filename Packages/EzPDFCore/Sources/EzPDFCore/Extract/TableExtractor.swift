@@ -49,13 +49,15 @@ public enum TableExtractor {
     /// Column x-ranges from where cells overlap; positions covered by few lines count as gaps,
     /// so one long description that spans two columns doesn't merge them.
     static func columnRanges(_ lines: [TextLine]) -> [ClosedRange<CGFloat>] {
-        let minX = lines.flatMap(\.cells).map(\.rect.minX).min() ?? 0
-        let maxX = lines.flatMap(\.cells).map(\.rect.maxX).max() ?? 0
-        guard maxX > minX else { return [] }
+        let cells = lines.flatMap(\.cells).filter { $0.rect.minX.isFinite && $0.rect.maxX.isFinite }
+        let minX = cells.map(\.rect.minX).min() ?? 0
+        let maxX = cells.map(\.rect.maxX).max() ?? 0
+        // A sane page is a few thousand points wide; anything else is a broken rect.
+        guard maxX > minX, maxX - minX < 20_000 else { return [] }
         let width = Int(maxX - minX) + 1
         var coverage = [Int](repeating: 0, count: width)
         for line in lines {
-            for cell in line.cells {
+            for cell in line.cells where cell.rect.minX.isFinite && cell.rect.maxX.isFinite {
                 let a = Int(cell.rect.minX - minX), b = min(width - 1, Int(cell.rect.maxX - minX))
                 if a <= b { for x in a...b { coverage[x] += 1 } }
             }

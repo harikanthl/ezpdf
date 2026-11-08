@@ -56,9 +56,22 @@ public final class EzPDF {
 
     // MARK: Jobs
 
-    private func run<T>(_ title: String, source: JobSource, _ body: (Job) async throws -> T) async throws -> T {
+    /// Conversions open web views and use a lot of memory; this many may run at once.
+    static let maxConcurrentConversions = 3
+    private var activeConversions = 0
+
+    private func run<T>(_ title: String, source: JobSource, conversion: Bool = false, observe: ((Job) -> Void)? = nil,
+                        _ body: (Job) async throws -> T) async throws -> T {
+        if conversion {
+            guard activeConversions < Self.maxConcurrentConversions else {
+                throw EzPDFError.unavailable("ezpdf is already converting \(activeConversions) things. Try again when one finishes.")
+            }
+            activeConversions += 1
+        }
+        defer { if conversion { activeConversions -= 1 } }
         let job = Job(title: title, source: source)
         jobs.insert(job, at: 0)
+        observe?(job)
         do {
             let value = try await body(job)
             job.state = .done
@@ -77,7 +90,8 @@ public final class EzPDF {
         // Keep finished jobs briefly so their rows can show the result, then drop them.
         let cutoff = Date().addingTimeInterval(-600)
         jobs.removeAll { $0.state != .running && $0.startedAt < cutoff }
-        if jobs.count > 30 { jobs.removeLast(jobs.count - 30) }
+        // Over the cap, drop the oldest finished jobs; never a running one.
+        while jobs.count > 30, let i = jobs.lastIndex(where: { $0.state != .running }) { jobs.remove(at: i) }
     }
 
     public func dismissJob(_ id: UUID) { jobs.removeAll { $0.id == id } }
@@ -86,10 +100,13 @@ public final class EzPDF {
 
     @discardableResult
     public func convert(url: URL, preset: PagePreset? = nil, format: OutputFormat? = nil, title: String? = nil,
-                        source: JobSource = .app) async throws -> DocumentRecord {
+                        source: JobSource = .app, observe: ((Job) -> Void)? = nil) async throws -> DocumentRecord {
         let preset = preset ?? defaultPreset
         let format = format ?? defaultFormat
-        return try await run(url.host() ?? url.absoluteString, source: source) { job in
+        guard await URLGuard.resolvesPublic(url) else {
+            throw EzPDFError.invalidInput("ezpdf doesn't open addresses on your local network.")
+        }
+        return try await run(url.host() ?? url.absoluteString, source: source, conversion: true, observe: observe) { job in
             // A link straight to a PDF (statements, papers): keep the file itself.
             if let pdf = try await Self.downloadIfPDF(url) {
                 job.detail = "Saving the PDF"
@@ -107,7 +124,7 @@ public final class EzPDF {
             var rec = DocumentRecord(title: title ?? out.title, kind: .web, sourceURL: url.absoluteString,
                                      byline: out.article?.byline, siteName: out.article?.siteName ?? out.finalURL.host(),
                                      excerpt: out.article?.excerpt, preset: preset.rawValue)
-            rec = try library.add(rec, pdfData: out.pdf, epubData: out.epub, articleHTML: out.article?.html)
+            rec = try library.add(rec, pdfData: out.pdf, epubData: out.epub, articleHTML: out.article?.html.strippingInlineImages)
             job.documentID = rec.id
             return rec
         }
@@ -116,40 +133,42 @@ public final class EzPDF {
     /// The page as the browser already shows it (works behind logins).
     @discardableResult
     public func convert(html: String, url: URL, preset: PagePreset? = nil, format: OutputFormat? = nil, title: String? = nil,
-                        source: JobSource = .browser) async throws -> DocumentRecord {
+                        source: JobSource = .browser, observe: ((Job) -> Void)? = nil) async throws -> DocumentRecord {
         let preset = preset ?? defaultPreset
         let format = format ?? defaultFormat
-        return try await run(url.host() ?? "Page", source: source) { job in
+        guard html.utf8.count <= 20_000_000 else { throw EzPDFError.invalidInput("That page is too large to convert.") }
+        return try await run(url.host() ?? "Page", source: source, conversion: true, observe: observe) { job in
             let out = try await WebConverter.convert(html: html, url: url, preset: preset, format: format) { job.detail = $0 }
             job.title = title ?? out.title
             job.notes = out.notes
             var rec = DocumentRecord(title: title ?? out.title, kind: .web, sourceURL: url.absoluteString,
                                      byline: out.article?.byline, siteName: out.article?.siteName ?? url.host(),
                                      excerpt: out.article?.excerpt, preset: preset.rawValue)
-            rec = try library.add(rec, pdfData: out.pdf, epubData: out.epub, articleHTML: out.article?.html)
+            rec = try library.add(rec, pdfData: out.pdf, epubData: out.epub, articleHTML: out.article?.html.strippingInlineImages)
             job.documentID = rec.id
             return rec
         }
     }
 
+    /// If `url` serves a PDF, returns its bytes (one request, redirects re-checked, 300 MB cap).
     static func downloadIfPDF(_ url: URL) async throws -> Data? {
-        guard URLGuard.isAllowed(url) else { return nil }
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 30
-        config.httpAdditionalHeaders = ["User-Agent": WebSession.userAgent]
-        let session = URLSession(configuration: config)
-        defer { session.finishTasksAndInvalidate() }
-        var head = URLRequest(url: url)
-        head.httpMethod = "HEAD"
+        let dl = GuardedDownload()
+        defer { dl.finish() }
         let looksPDF = url.pathExtension.lowercased() == "pdf"
-        if !looksPDF {
-            guard let (_, resp) = try? await session.data(for: head),
-                  (resp as? HTTPURLResponse)?.mimeType == "application/pdf" else { return nil }
+        let outcome: GuardedDownload.Outcome
+        do {
+            outcome = try await dl.fetch(url, maxBytes: 300_000_000) { resp in
+                resp.mimeType == "application/pdf" || (looksPDF && resp.mimeType == "application/octet-stream")
+            }
+        } catch {
+            if looksPDF { throw error }
+            return nil   // not a PDF link, or HEAD-less server hiccup: let the web view handle it
         }
-        let (data, resp) = try await session.data(from: url)
-        if let final = resp.url, !URLGuard.isAllowed(final) { throw EzPDFError.invalidInput("The link redirected to a local address.") }
-        guard data.starts(with: Data("%PDF".utf8)), data.count < 300_000_000 else { return looksPDF ? nil : nil }
-        return data
+        switch outcome {
+        case .data(let data, _): return data.starts(with: Data("%PDF".utf8)) ? data : nil
+        case .tooLarge: throw EzPDFError.invalidInput("That PDF is over 300 MB.")
+        case .skipped: return nil
+        }
     }
 
     @discardableResult
@@ -160,7 +179,7 @@ public final class EzPDF {
         for f in files where !FileManager.default.isReadableFile(atPath: f.path) {
             throw EzPDFError.invalidInput("Can't read \(f.path).")
         }
-        return try await run(first.lastPathComponent, source: source) { job in
+        return try await run(first.lastPathComponent, source: source, conversion: true) { job in
             job.detail = files.count > 1 ? "Combining \(files.count) files" : "Converting"
             let out = try await FileConverter.convert(files, preset: preset)
             let kind: DocumentRecord.Kind = first.pathExtension.lowercased() == "pdf" && files.count == 1 ? .imported : .file
@@ -195,14 +214,28 @@ public final class EzPDF {
         return Array(docs.prefix(max(1, limit)))
     }
 
-    public func record(_ id: String) throws -> DocumentRecord {
-        guard let r = library.resolve(id) else { throw EzPDFError.notFound(id) }
-        return r
+    /// Finds a document by id or title. A title must match one document; with `strict` (anything
+    /// that changes or deletes), only an exact id or an exact, unique title is accepted.
+    public func record(_ id: String, strict: Bool = false) throws -> DocumentRecord {
+        let m = library.matches(id)
+        switch m {
+        case .id(let r): return r
+        case .exactTitles(let rs) where rs.count == 1: return rs[0]
+        case .partialTitles(let rs) where rs.count == 1 && !strict: return rs[0]
+        case .none: throw EzPDFError.notFound(id)
+        case .exactTitles(let rs), .partialTitles(let rs):
+            if strict, case .partialTitles = m, rs.count == 1 {
+                throw EzPDFError.invalidInput("To change or delete “\(rs[0].title)”, pass its id: \(rs[0].id).")
+            }
+            let list = rs.prefix(5).map { "“\($0.title)” (id \($0.id))" }.joined(separator: ", ")
+            throw EzPDFError.invalidInput("“\(id)” matches \(rs.count) documents: \(list). Pass the id.")
+        }
     }
 
-    public func document(_ id: String) throws -> (DocumentRecord, PDFDocument) {
-        let rec = try record(id)
+    public func document(_ id: String, strict: Bool = false) throws -> (DocumentRecord, PDFDocument) {
+        let rec = try record(id, strict: strict)
         guard let doc = PDFDocument(url: library.pdfURL(for: rec.id)) else { throw EzPDFError.failed("The PDF for “\(rec.title)” is missing or damaged.") }
+        if doc.isLocked { throw EzPDFError.invalidInput("“\(rec.title)” has a password. Unlock it first (improve_pdf unlock).") }
         return (rec, doc)
     }
 
@@ -250,12 +283,19 @@ public final class EzPDF {
 
     public struct SearchHit: Codable, Sendable { public var id: String; public var title: String; public var page: Int; public var snippet: String }
 
-    public func search(_ query: String, in id: String? = nil, limit: Int = 50) throws -> [SearchHit] {
+    /// Searches off the main thread with its own PDFDocuments, so a big library doesn't freeze the UI.
+    public func search(_ query: String, in id: String? = nil, limit: Int = 50) async throws -> [SearchHit] {
         guard query.trimmingCharacters(in: .whitespaces).count >= 2 else { throw EzPDFError.invalidInput("Search for at least 2 characters.") }
         let recs = try id.map { [try record($0)] } ?? library.all()
+        let files = recs.map { (id: $0.id, title: $0.title, url: library.pdfURL(for: $0.id)) }
+        let limit = max(1, limit)
+        return await Task.detached(priority: .userInitiated) { Self.searchFiles(files, query: query, limit: limit) }.value
+    }
+
+    nonisolated private static func searchFiles(_ files: [(id: String, title: String, url: URL)], query: String, limit: Int) -> [SearchHit] {
         var hits: [SearchHit] = []
-        for rec in recs {
-            guard let doc = PDFDocument(url: library.pdfURL(for: rec.id)) else { continue }
+        for rec in files {
+            guard let doc = PDFDocument(url: rec.url), !doc.isLocked else { continue }
             for sel in doc.findString(query, withOptions: [.caseInsensitive, .diacriticInsensitive]).prefix(limit) {
                 guard let page = sel.pages.first else { continue }
                 let ext = sel.copy() as! PDFSelection
@@ -287,17 +327,39 @@ public final class EzPDF {
     }
 
     private func commit(_ id: String, data: Data) throws -> DocumentRecord {
+        guard let check = PDFDocument(data: data), check.pageCount > 0 || check.isLocked else {
+            throw EzPDFError.failed("That change produced a broken PDF, so it wasn't saved.")
+        }
         let current = library.pdfURL(for: id)
         let backup = library.folder(for: id).appendingPathComponent("document.prev.pdf")
-        try? FileManager.default.removeItem(at: backup)
-        try? FileManager.default.copyItem(at: current, to: backup)
+        let staging = library.folder(for: id).appendingPathComponent(".document.prev.\(UUID().uuidString).pdf")
+        do {
+            try FileManager.default.copyItem(at: current, to: staging)
+            _ = try FileManager.default.replaceItemAt(backup, withItemAt: staging)
+        } catch {
+            try? FileManager.default.removeItem(at: staging)
+            throw EzPDFError.failed("Couldn't keep an undo copy, so the change wasn't made: \(error.localizedDescription)")
+        }
         return try library.replacePDF(id, with: data)
+    }
+
+    /// Adds annotations made in the reader onto the current file (not over it), with an undo point.
+    /// Merging onto what's on disk means edits made meanwhile (page changes, agents) are kept.
+    @discardableResult
+    public func addAnnotations(_ id: String, _ items: [(page: Int, annotation: PDFAnnotation)]) throws -> DocumentRecord {
+        let (rec, doc) = try document(id)
+        guard !items.isEmpty else { return rec }
+        for item in items {
+            guard let page = doc.page(at: item.page), let copy = item.annotation.copy() as? PDFAnnotation else { continue }
+            page.addAnnotation(copy)
+        }
+        return try commit(rec.id, doc)
     }
 
     /// Restores the version before the last edit.
     @discardableResult
     public func undo(_ id: String) throws -> DocumentRecord {
-        let rec = try record(id)
+        let rec = try record(id, strict: true)
         let backup = library.folder(for: rec.id).appendingPathComponent("document.prev.pdf")
         guard let data = try? Data(contentsOf: backup) else { throw EzPDFError.invalidInput("Nothing to undo for “\(rec.title)”.") }
         let out = try library.replacePDF(rec.id, with: data)
@@ -316,7 +378,7 @@ public final class EzPDF {
 
     public func pages(_ id: String, action: PageAction, pages spec: String? = nil, degrees: Int = 90,
                       to position: Int? = nil, every: Int? = nil, startPages: [Int]? = nil) throws -> PageResult {
-        let (rec, doc) = try document(id)
+        let (rec, doc) = try document(id, strict: action != .extract && action != .split)
         switch action {
         case .rotate:
             try PageOps.rotate(doc, pages: try PageOps.pages(spec, count: doc.pageCount), degrees: degrees)
@@ -347,7 +409,7 @@ public final class EzPDF {
             var created: [DocumentRecord] = []
             for (i, part) in parts.enumerated() {
                 guard let data = part.dataRepresentation() else { continue }
-                created.append(try library.add(DocumentRecord(title: "\(rec.title) — part \(i + 1)", kind: .file, preset: rec.preset), pdfData: data))
+                created.append(try library.add(DocumentRecord(title: "\(rec.title), part \(i + 1)", kind: .file, preset: rec.preset), pdfData: data))
             }
             return PageResult(document: rec, created: created)
         }
@@ -371,18 +433,24 @@ public final class EzPDF {
     }
 
     public func optimize(_ id: String, _ action: Optimization, password: String? = nil, text: String? = nil) async throws -> (record: DocumentRecord, before: Int, after: Int) {
-        let rec = try record(id)
+        let rec = try record(id, strict: true)
         let before = rec.byteCount
         let url = library.pdfURL(for: rec.id)
+        let revision = rec.modifiedAt
         let out: Data?
         switch action {
         case .compress, .compress_strong:
-            let (_, doc) = try document(id)
+            let (_, doc) = try document(rec.id)
             out = PageOps.compress(doc, level: action == .compress ? .light : .strong)
             if let o = out, o.count >= before { return (rec, before, before) }    // never make it bigger
         case .make_searchable:
-            let (_, doc) = try document(id)
-            out = await Task.detached { PageOps.makeSearchable(doc) }.value
+            // OCR is slow, so it runs off the main thread on its own copy of the document
+            // (PDFDocument isn't thread-safe; nothing else touches this one).
+            let fileURL = url
+            out = await Task.detached(priority: .userInitiated) { () -> Data? in
+                guard let own = PDFDocument(url: fileURL) else { return nil }
+                return PageOps.makeSearchable(own)
+            }.value
         case .protect:
             guard let password, !password.isEmpty else { throw EzPDFError.invalidInput("Give a password.") }
             let (_, doc) = try document(id)
@@ -400,45 +468,52 @@ public final class EzPDF {
             out = doc.dataRepresentation()
         }
         guard let out else { throw EzPDFError.failed("That didn't work on this PDF.") }
+        // Slow steps (OCR) await; if the document changed meanwhile, don't overwrite that change.
+        guard library.record(rec.id)?.modifiedAt == revision else {
+            throw EzPDFError.failed("“\(rec.title)” changed while this was running, so the result wasn't saved. Try again.")
+        }
         let saved = try commit(rec.id, data: out)
         return (saved, before, out.count)
     }
 
     public func highlight(_ id: String, text: String, pages: String? = nil) throws -> (record: DocumentRecord, count: Int) {
-        let (rec, doc) = try document(id)
-        let set = pages.map { try? Set(PageOps.pages($0, count: doc.pageCount)) } ?? nil
+        let (rec, doc) = try document(id, strict: true)
+        let set = try pages.map { Set(try PageOps.pages($0, count: doc.pageCount)) }
         let n = PageOps.highlight(doc, text: text, pages: set)
         guard n > 0 else { throw EzPDFError.invalidInput("“\(text)” doesn't appear in “\(rec.title)”.") }
         return (try commit(rec.id, doc), n)
     }
 
     public func addNote(_ id: String, page: Int, text: String) throws -> DocumentRecord {
-        let (rec, doc) = try document(id)
+        let (rec, doc) = try document(id, strict: true)
         try PageOps.addNote(doc, page: page - 1, text: text)
         return try commit(rec.id, doc)
     }
 
     public func rename(_ id: String, title: String) throws -> DocumentRecord {
-        let rec = try record(id)
-        try library.update(rec.id) { $0.title = title }
+        let rec = try record(id, strict: true)
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)
+        guard !clean.isEmpty else { throw EzPDFError.invalidInput("Give a title.") }
+        try library.update(rec.id) { $0.title = String(clean) }
         return try record(rec.id)
     }
 
     public func delete(_ id: String) throws -> DocumentRecord {
-        let rec = try record(id)
+        let rec = try record(id, strict: true)
         try library.delete(rec.id)
         return rec
     }
 
     // MARK: Data
 
-    public func extract(_ id: String, kind: ExtractKind = .auto, source: JobSource = .app) async throws -> ExtractionResult {
+    /// `remember` files the document under Statements/Invoices; read-only callers pass false.
+    public func extract(_ id: String, kind: ExtractKind = .auto, source: JobSource = .app, remember: Bool = true) async throws -> ExtractionResult {
         let (rec, doc) = try document(id)
         return try await run("Reading \(rec.title)", source: source) { job in
             job.detail = "Reading the pages"
             let result = await DataExtractor.extract(doc, kind: kind)
             job.documentID = rec.id
-            if result.kind == .statement || result.kind == .invoice {
+            if remember, result.kind == .statement || result.kind == .invoice {
                 try? library.update(rec.id) { $0.kind = result.kind == .statement ? .statement : .invoice }
             }
             return result
@@ -451,7 +526,7 @@ public final class EzPDF {
     public func saveExtraction(_ result: ExtractionResult, for id: String, format: DataFormat, folder: URL? = nil) throws -> URL {
         let rec = try record(id)
         let suffix = result.kind == .statement ? "transactions" : result.kind == .invoice ? "invoice" : "tables"
-        let base = "\(safeName(rec.title)) – \(suffix)"
+        let base = "\(safeName(rec.title)) \(suffix)"
         let data: Data
         switch format {
         case .csv: data = Spreadsheet.csv(result.csvRows)
@@ -476,7 +551,13 @@ public final class EzPDF {
         return try await run("Summarizing \(rec.title)", source: .app) { job in
             job.detail = "Reading on this Mac"
             job.documentID = rec.id
-            return try await AIExtractor.summarize(cleaned)
+            let raw = try await AIExtractor.summarize(cleaned)
+            // Show bullets as "•", never as "-" or "*".
+            return raw.split(separator: "\n", omittingEmptySubsequences: false).map { line -> String in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if let r = t.range(of: #"^([-*–—]|\d+[.)])\s+"#, options: .regularExpression) { return "• " + t[r.upperBound...] }
+                return t
+            }.joined(separator: "\n")
         }
     }
 
@@ -493,8 +574,12 @@ public final class EzPDF {
         return try write(try Data(contentsOf: src), name: safeName(rec.title), ext: format.rawValue, folder: folder)
     }
 
+    /// Writes only inside the export folder the user chose (callers can pick a subfolder of it).
     private func write(_ data: Data, name: String, ext: String, folder: URL?) throws -> URL {
         let dir = folder ?? exportFolder
+        guard FileAccess.isInside(dir, exportFolder) else {
+            throw EzPDFError.invalidInput("ezpdf saves only into your export folder (\(exportFolder.lastPathComponent)).")
+        }
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var url = dir.appendingPathComponent("\(name).\(ext)")
         var n = 2
@@ -503,18 +588,22 @@ public final class EzPDF {
         return url
     }
 
+    /// A file name from a title: no path characters, no control characters, not hidden.
     private func safeName(_ s: String) -> String {
-        String(s.replacingOccurrences(of: "[/:\\\\?%*|\"<>]", with: "-", options: .regularExpression).prefix(90))
+        var n = s.replacingOccurrences(of: "[/:\\\\?%*|\"<>\\p{Cc}]", with: " ", options: .regularExpression)
+        n = n.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: ".")))
+        n = String(n.prefix(90))
+        return n.isEmpty ? "Document" : n
     }
 
     /// Sends to Kindle. EPUB is used when the document has one and the settings prefer it.
-    public func sendToKindle(_ id: String, format: ExportFormat? = nil) throws -> (record: DocumentRecord, format: ExportFormat, address: String) {
+    public func sendToKindle(_ id: String, format: ExportFormat? = nil) async throws -> (record: DocumentRecord, format: ExportFormat, address: String) {
         let rec = try record(id)
         let settings = KindleSender.Settings.load()
         let useEPUB = format.map { $0 == .epub } ?? (settings.preferEPUB && rec.hasEPUB)
         let file = useEPUB ? library.epubURL(for: rec.id) : library.pdfURL(for: rec.id)
         if useEPUB, !rec.hasEPUB { throw EzPDFError.invalidInput("“\(rec.title)” has no EPUB.") }
-        try KindleSender.send(file: file, title: rec.title, settings: settings)
+        try await KindleSender.send(file: file, title: rec.title, settings: settings)
         try library.update(rec.id) { $0.sentToKindleAt = Date() }
         return (try record(rec.id), useEPUB ? .epub : .pdf, settings.address)
     }

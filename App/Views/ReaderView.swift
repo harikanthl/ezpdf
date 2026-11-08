@@ -36,7 +36,7 @@ struct ReaderView: View {
                     PDFViewHost(controller: reader)
                         .opacity(mode == .read ? 1 : 0)
                     if mode == .pages {
-                        PagesView(record: record) { reload() }
+                        PagesView(record: record, beforeEdit: { reader.flushAnnotations() })
                     }
                 }
             }
@@ -45,9 +45,14 @@ struct ReaderView: View {
         .navigationSubtitle(subtitle)
         .toolbar { toolbar }
         .onAppear { reload(page: app.openPage); app.openPage = nil }
-        .onChange(of: record.id) { reload(page: app.openPage); app.openPage = nil; mode = .read }
-        .onChange(of: record.modifiedAt) { if !reader.unsavedAnnotations { reload(page: reader.currentPageIndex + 1) } }
-        .onChange(of: app.openPage) { if let p = app.openPage { reader.goTo(pageNumber: p); app.openPage = nil } }
+        .onChange(of: record.modifiedAt) {
+            // Reload only for changes made elsewhere (page edits, agents, undo), not our own saves.
+            // load() first merges any pending highlights onto the new version.
+            if record.modifiedAt != reader.lastSavedModifiedAt { reload(page: reader.currentPageIndex + 1) }
+        }
+        .onChange(of: app.openPage) {
+            if let p = app.openPage { withoutAnimation { mode = .read }; reader.goTo(pageNumber: p); app.openPage = nil }
+        }
         .onChange(of: reader.currentPageIndex) { pageField = "\(reader.currentPageIndex + 1)" }
         .onDisappear { reader.flushAnnotations(); reader.stopSpeaking() }
         .sheet(isPresented: $showSummary) {
@@ -282,6 +287,7 @@ struct ReaderView: View {
     }
 
     private func undo() {
+        reader.flushAnnotations()
         do { _ = try app.ops.undo(record.id); app.show("Restored the previous version") }
         catch { app.show(error.localizedDescription, error: true) }
     }

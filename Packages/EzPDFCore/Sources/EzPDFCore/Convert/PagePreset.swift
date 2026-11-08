@@ -26,7 +26,7 @@ public enum PagePreset: String, CaseIterable, Codable, Sendable, Identifiable {
 
     public var detail: String {
         switch self {
-        case .kindle: return "Large type, 3:4 pages for 6–7″ e-readers"
+        case .kindle: return "Large type, 3:4 pages for 6 to 7 inch Kindles"
         case .kindleScribe: return "3:4 pages sized for the 10″ Scribe"
         case .phone: return "Tall pages for reading on a phone"
         case .letter: return "8.5 × 11 in, for printing"

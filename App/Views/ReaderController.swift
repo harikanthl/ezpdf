@@ -42,11 +42,20 @@ final class ReaderController: NSObject, ObservableObject {
     @Published var twoUp = false
     @Published var hasSelection = false
     @Published var unsavedAnnotations = false
+    /// When this reader last saved the document; its own saves don't trigger a reload.
+    private(set) var lastSavedModifiedAt: Date?
+    /// The file version currently shown.
+    private(set) var loadedModifiedAt: Date?
 
     private var matches: [PDFSelection] = []
     private let synthesizer = AVSpeechSynthesizer()
-    private var observers: [NSObjectProtocol] = []
+    nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
     private var saveTask: Task<Void, Never>?
+    /// Highlights and notes added since the last save. Saving merges these onto the file on disk
+    /// rather than writing this window's copy over it, so edits made meanwhile survive.
+    private var pending: [(page: Int, annotation: PDFAnnotation)] = []
+    /// True while opening a document, so the initial scroll doesn't overwrite the saved page.
+    private var restoring = false
 
     override init() {
         super.init()
@@ -68,29 +77,39 @@ final class ReaderController: NSObject, ObservableObject {
         observers.append(center.addObserver(forName: .PDFViewSelectionChanged, object: pdfView, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.hasSelection = !(self?.pdfView.currentSelection?.string ?? "").isEmpty }
         })
-        observers.append(center.addObserver(forName: .PDFViewAnnotationHit, object: pdfView, queue: .main) { _ in })
+    }
+
+    deinit {
+        for o in observers { NotificationCenter.default.removeObserver(o) }
     }
 
     func load(_ rec: DocumentRecord, url: URL, page: Int? = nil) {
         flushAnnotations()
-        stopSpeaking()
-        clearSearch()
+        let sameDocument = documentID == rec.id
+        if !sameDocument {
+            stopSpeaking()
+            clearSearch()
+        }
         documentID = rec.id
+        loadedModifiedAt = Library.shared.record(rec.id)?.modifiedAt ?? rec.modifiedAt
+        restoring = true
         guard let document = PDFDocument(url: url) else { pdfView.document = nil; pageCount = 0; return }
         pdfView.document = document
         pageCount = document.pageCount
         buildOutline(document)
         setTheme(theme)
         let start = (page.map { $0 - 1 }) ?? rec.lastPage
-        syncPage()
-        if start > 0 {
-            // PDFView ignores go(to:) until it has laid the document out.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, let p = document.page(at: min(start, document.pageCount - 1)) else { return }
+        // PDFView ignores go(to:) until it has laid the document out.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if start > 0, let p = document.page(at: min(start, document.pageCount - 1)) {
                 self.pdfView.layoutDocumentView()
                 self.pdfView.go(to: p)
             }
+            self.restoring = false
+            self.syncPage()
         }
+        if sameDocument, !matches.isEmpty { clearSearch() }   // old selections belong to the old document
         syncZoom()
     }
 
@@ -113,7 +132,7 @@ final class ReaderController: NSObject, ObservableObject {
     private func syncPage() {
         guard let doc = pdfView.document, let page = pdfView.currentPage else { return }
         currentPageIndex = doc.index(for: page)
-        rememberPage()
+        if !restoring { rememberPage() }
     }
 
     private var rememberTask: Task<Void, Never>?
@@ -196,6 +215,7 @@ final class ReaderController: NSObject, ObservableObject {
                 let a = PDFAnnotation(bounds: line.bounds(for: page), forType: type, withProperties: nil)
                 a.color = type == .highlight ? color.withAlphaComponent(0.45) : color
                 page.addAnnotation(a)
+                if let doc = pdfView.document { pending.append((doc.index(for: page), a)) }
             }
         }
         pdfView.clearSelection()
@@ -209,6 +229,7 @@ final class ReaderController: NSObject, ObservableObject {
         a.contents = text
         a.color = .systemYellow
         page.addAnnotation(a)
+        if let doc = pdfView.document { pending.append((doc.index(for: page), a)) }
         scheduleSave()
     }
 
@@ -218,12 +239,23 @@ final class ReaderController: NSObject, ObservableObject {
         saveTask = Task { try? await Task.sleep(for: .seconds(1.5)); if !Task.isCancelled { flushAnnotations() } }
     }
 
-    /// Writes annotation changes to the library copy.
+    /// Saves pending highlights and notes by adding them to the current file (with an undo point).
+    /// Call before any other edit so the order of changes is kept.
     func flushAnnotations() {
         saveTask?.cancel()
-        guard unsavedAnnotations, let id = documentID, let data = pdfView.document?.dataRepresentation() else { return }
+        guard let id = documentID, !pending.isEmpty else { unsavedAnnotations = false; return }
+        let items = pending
+        pending = []
         unsavedAnnotations = false
-        _ = try? Library.shared.replacePDF(id, with: data)
+        do {
+            let rec = try EzPDF.shared.addAnnotations(id, items)
+            lastSavedModifiedAt = rec.modifiedAt
+            // If nothing else changed the file, what's on screen is what's saved.
+            if loadedModifiedAt != nil { loadedModifiedAt = rec.modifiedAt }
+        } catch {
+            pending = items + pending      // keep them; try again on the next save
+            unsavedAnnotations = true
+        }
     }
 
     // MARK: Read aloud

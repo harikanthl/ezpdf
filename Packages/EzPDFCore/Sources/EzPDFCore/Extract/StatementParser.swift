@@ -49,6 +49,7 @@ public enum StatementParser {
         let allText = lines.map(\.text).joined(separator: "\n")
         let dayFirst = DateToken.detectDayFirst(lines.compactMap { $0.cells.first?.text })
         let baseYear = mostCommonYear(in: allText) ?? Calendar.current.component(.year, from: Date())
+        var inferredYear = Set<Int>()   // indices of rows whose date had no year
 
         var headers: [Column: CGRect] = [:]
         var headerPage = -1
@@ -115,6 +116,7 @@ public enum StatementParser {
                 } else if !signKnown, headers.isEmpty {
                     a = guessSign(a, description: desc)
                 }
+                if d.year == nil { inferredYear.insert(txns.count) }
                 txns.append(Transaction(date: DateToken.iso(d, fallbackYear: baseYear), description: desc,
                                         amount: a, balance: balance, page: line.page + 1, reconciled: reconciled))
                 lastDate = d
@@ -134,7 +136,7 @@ public enum StatementParser {
             if !desc.isEmpty { lastWasTxn = false }
         }
 
-        fixYearWrap(&txns)
+        fixYearWrap(&txns, inferred: inferredYear, text: allText)
         let totalIn = txns.filter { $0.amount > 0 }.reduce(0) { $0 + $1.amount }
         let totalOut = txns.filter { $0.amount < 0 }.reduce(0) { $0 - $1.amount }
         let withBalance = txns.filter { $0.balance != nil }
@@ -239,24 +241,34 @@ public enum StatementParser {
         return incoming.contains(where: d.contains) ? abs(a) : -abs(a)
     }
 
-    static func mostCommonYear(in text: String) -> Int? {
+    static func yearCounts(in text: String) -> [Int: Int] {
         let re = try! NSRegularExpression(pattern: #"\b(19[89]\d|20\d{2})\b"#)
         var counts: [Int: Int] = [:]
         for m in re.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
             if let r = Range(m.range, in: text), let y = Int(text[r]) { counts[y, default: 0] += 1 }
         }
-        return counts.max { $0.value < $1.value }?.key
+        return counts
     }
 
-    /// Statements spanning New Year list December rows with the January year; move them back.
-    static func fixYearWrap(_ txns: inout [Transaction]) {
-        let months = Set(txns.compactMap { Int($0.date.dropFirst(5).prefix(2)) })
+    /// The year mentioned most; ties go to the later year (the statement's end), deterministically.
+    static func mostCommonYear(in text: String) -> Int? {
+        yearCounts(in: text).max { $0.value != $1.value ? $0.value < $1.value : $0.key < $1.key }?.key
+    }
+
+    /// Rows without a year on a statement that spans New Year (Dec and Jan rows, and both years
+    /// mentioned): late-year months get the earlier year, early months the later one. Rows that
+    /// printed their own year are never changed.
+    static func fixYearWrap(_ txns: inout [Transaction], inferred: Set<Int>, text: String) {
+        guard !inferred.isEmpty else { return }
+        let months = Set(inferred.compactMap { i in Int(txns[i].date.dropFirst(5).prefix(2)) })
         guard months.contains(12), months.contains(1) else { return }
-        for i in txns.indices {
+        let years = Set(yearCounts(in: text).keys)
+        guard let early = years.filter({ years.contains($0 + 1) }).max() else { return }
+        for i in inferred {
             let parts = txns[i].date.split(separator: "-")
-            guard parts.count == 3, let y = Int(parts[0]), let m = Int(parts[1]), m >= 10 else { continue }
-            let hasLaterJanuary = txns.contains { $0.date.hasPrefix("\(y)-01") }
-            if hasLaterJanuary { txns[i].date = String(format: "%04d-%@-%@", y - 1, String(parts[1]), String(parts[2])) }
+            guard parts.count == 3, let m = Int(parts[1]) else { continue }
+            let y = m >= 7 ? early : early + 1
+            txns[i].date = String(format: "%04d-%@-%@", y, String(parts[1]), String(parts[2]))
         }
     }
 }

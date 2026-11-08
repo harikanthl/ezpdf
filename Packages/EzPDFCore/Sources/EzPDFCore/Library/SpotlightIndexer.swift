@@ -23,9 +23,12 @@ public enum SpotlightIndexer {
             if let s = rec.sourceURL { attrs.url = URL(string: s) }
             if let doc = PDFDocument(url: pdf) {
                 var text = ""
+                var bytes = 0
                 for i in 0..<min(doc.pageCount, 300) {
-                    text += (doc.page(at: i)?.string ?? "") + "\n"
-                    if text.count > 200_000 { break }
+                    let t = (doc.page(at: i)?.string ?? "") + "\n"
+                    text += t
+                    bytes += t.utf8.count
+                    if bytes > 400_000 { break }
                 }
                 attrs.textContent = text
             }

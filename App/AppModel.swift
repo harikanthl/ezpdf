@@ -38,6 +38,8 @@ final class AppModel {
     var openPage: Int?
     var extractFor: DocumentRecord?
     var renaming: DocumentRecord?
+    /// Set to a tab to open Settings there (from ezpdf://settings links).
+    var settingsRequest: String?
 
     private var toastTask: Task<Void, Never>?
 
@@ -124,18 +126,22 @@ final class AppModel {
             if selection == nil { selection = rec.id }
             let notes = ops.jobs.first { $0.documentID == rec.id }?.notes ?? []
             show(notes.first ?? "“\(rec.title)” is ready", documentID: rec.id)
-        case .kindle: sendToKindle(rec)
+        case .kindle:
+            sendToKindle(rec)
         case .extract: extractFor = rec
         case .stay: break
         }
     }
 
     func sendToKindle(_ rec: DocumentRecord) {
-        do {
-            let r = try ops.sendToKindle(rec.id)
-            show("Sent to Kindle as \(r.format.rawValue.uppercased())")
-        } catch {
-            show(error.localizedDescription, error: true)
+        show("Sending “\(rec.title)” to your Kindle…")
+        Task {
+            do {
+                let r = try await ops.sendToKindle(rec.id)
+                show("Sent to Kindle as \(r.format.rawValue.uppercased())")
+            } catch {
+                show(error.localizedDescription, error: true)
+            }
         }
     }
 
@@ -179,7 +185,8 @@ final class AppModel {
                 handled = true
                 group.enter()
                 _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    if let url { lock.lock(); fileURLs.append(url); lock.unlock() }
+                    // Finder can hand over file-reference URLs (file:///.file/id=…); use the real path.
+                    if let url, let path = (url as NSURL).filePathURL { lock.lock(); fileURLs.append(path); lock.unlock() }
                     group.leave()
                 }
             } else if p.hasItemConformingToTypeIdentifier(UTType.url.identifier) {

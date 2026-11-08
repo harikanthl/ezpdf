@@ -8,11 +8,11 @@ import UniformTypeIdentifiers
 /// get the same reader layout as web articles.
 @MainActor
 public enum FileConverter {
-    public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "tif", "tiff", "gif", "webp", "bmp", "avif"]
-    public static let richExtensions: Set<String> = ["docx", "doc", "rtf", "rtfd", "odt", "webarchive", "wordml"]
-    public static let textExtensions: Set<String> = ["md", "markdown", "txt", "text", "html", "htm", "csv", "tsv", "json", "log", "xml", "yaml", "yml", "swift", "py", "js", "ts"]
+    nonisolated public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "heic", "heif", "tif", "tiff", "gif", "webp", "bmp", "avif"]
+    nonisolated public static let richExtensions: Set<String> = ["docx", "doc", "rtf", "rtfd", "odt", "webarchive", "wordml"]
+    nonisolated public static let textExtensions: Set<String> = ["md", "markdown", "txt", "text", "html", "htm", "csv", "tsv", "json", "log", "xml", "yaml", "yml", "swift", "py", "js", "ts"]
 
-    public static var supportedExtensions: Set<String> { imageExtensions.union(richExtensions).union(textExtensions).union(["pdf"]) }
+    nonisolated public static var supportedExtensions: Set<String> { imageExtensions.union(richExtensions).union(textExtensions).union(["pdf"]) }
 
     public struct Output { public var pdf: Data; public var title: String }
 
@@ -28,7 +28,8 @@ public enum FileConverter {
             let merged = PDFDocument()
             for u in urls {
                 let part = try await convert([u], preset: preset)
-                if let d = PDFDocument(data: part.pdf) { PageOps.append(d, to: merged) }
+                guard let d = PDFDocument(data: part.pdf) else { throw EzPDFError.failed("\(u.lastPathComponent) couldn't be added.") }
+                PageOps.append(d, to: merged)
             }
             guard let data = merged.dataRepresentation() else { throw EzPDFError.failed("Couldn't join the files.") }
             return Output(pdf: data, title: title)
@@ -36,44 +37,57 @@ public enum FileConverter {
         switch ext {
         case "pdf":
             guard let doc = PDFDocument(url: first) else { throw EzPDFError.invalidInput("That PDF couldn't be opened.") }
-            if doc.isLocked { throw EzPDFError.invalidInput("That PDF is password-protected. Unlock it first.") }
+            if doc.isLocked { throw EzPDFError.invalidInput("That PDF has a password. Unlock it first.") }
             return Output(pdf: try Data(contentsOf: first), title: (doc.documentAttributes?[PDFDocumentAttribute.titleAttribute] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? title)
         case _ where imageExtensions.contains(ext):
             return Output(pdf: try images([first], preset: preset), title: title)
         case _ where richExtensions.contains(ext):
             return Output(pdf: try rich(first, preset: preset), title: title)
         case "md", "markdown":
-            let md = try String(contentsOf: first, encoding: .utf8)
+            let md = try readText(first)
             let body = Markdown.html(md)
             let docTitle = Markdown.firstHeading(md) ?? title
             let pdf = try await WebConverter.renderHTMLBody(body, title: docTitle, preset: preset, baseURL: nil,
-                                                            header: "", author: nil, subject: first.lastPathComponent, lang: nil)
+                                                            header: "", author: nil, subject: first.lastPathComponent, lang: nil).pdf
             return Output(pdf: pdf, title: docTitle)
         case "html", "htm":
-            let html = try String(contentsOf: first, encoding: .utf8)
+            let html = try readText(first)
             let body = html.range(of: "<body[^>]*>", options: [.regularExpression, .caseInsensitive]).map { r -> String in
                 let rest = html[r.upperBound...]
                 return String(rest[..<(rest.range(of: "</body>", options: .caseInsensitive)?.lowerBound ?? rest.endIndex)])
             } ?? html
             let pdf = try await WebConverter.renderHTMLBody(stripScripts(body), title: title, preset: preset, baseURL: nil,
-                                                            header: "", author: nil, subject: first.lastPathComponent, lang: nil)
+                                                            header: "", author: nil, subject: first.lastPathComponent, lang: nil).pdf
             return Output(pdf: pdf, title: title)
         case "csv", "tsv":
-            let text = try String(contentsOf: first, encoding: .utf8)
+            let text = try readText(first)
             let body = CSV.htmlTable(text, separator: ext == "tsv" ? "\t" : ",")
             let pdf = try await WebConverter.renderHTMLBody(body, title: title, preset: preset, baseURL: nil,
-                                                            header: ArticleHTML.header(title: title, subtitle: nil), author: nil, subject: first.lastPathComponent, lang: nil)
+                                                            header: ArticleHTML.header(title: title, subtitle: nil), author: nil, subject: first.lastPathComponent, lang: nil).pdf
             return Output(pdf: pdf, title: title)
         case _ where textExtensions.contains(ext):
-            let text = try String(contentsOf: first, encoding: .utf8)
+            let text = try readText(first)
             let body = "<div class=\"ez-plain\">\(ArticleHTML.escape(text))</div>"
             let pdf = try await WebConverter.renderHTMLBody(body, title: title, preset: preset, baseURL: nil,
                                                             header: ArticleHTML.header(title: first.lastPathComponent, subtitle: nil),
-                                                            author: nil, subject: first.lastPathComponent, lang: nil)
+                                                            author: nil, subject: first.lastPathComponent, lang: nil).pdf
             return Output(pdf: pdf, title: title)
         default:
             throw EzPDFError.invalidInput("ezpdf can't convert .\(ext) files yet. Supported: \(supportedExtensions.sorted().joined(separator: ", ")).")
         }
+    }
+
+    /// Reads a text file: UTF-8, or whatever encoding it declares or looks like (e.g. Windows-1252
+    /// CSV exports), refusing files too big to lay out.
+    static func readText(_ url: URL) throws -> String {
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        guard size <= 30 * 1024 * 1024 else { throw EzPDFError.invalidInput("\(url.lastPathComponent) is too large to turn into a PDF (over 30 MB of text).") }
+        let data = try Data(contentsOf: url)
+        if let s = String(data: data, encoding: .utf8) { return s }
+        var converted: NSString?
+        let enc = NSString.stringEncoding(for: data, encodingOptions: nil, convertedString: &converted, usedLossyConversion: nil)
+        if enc != 0, let converted { return converted as String }
+        return String(decoding: data, as: UTF8.self)
     }
 
     static func stripScripts(_ html: String) -> String {

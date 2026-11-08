@@ -110,7 +110,9 @@ public enum WebConverter {
         var usedReader = false
         if preset != .web, let article {
             progress("Laying out pages")
-            pdf = try await renderArticle(article, preset: preset)
+            let r = try await renderArticle(article, preset: preset)
+            pdf = r.pdf
+            if r.truncated { notes.append("The article was very long, so only the first part was saved.") }
             title = article.title
             usedReader = true
         } else {
@@ -122,8 +124,10 @@ public enum WebConverter {
             await scrollThrough(snap)
             await snap.waitForImages()
             let w = PagePreset.web.pageSize.width
-            pdf = try await PageLayout.renderPDF(session: snap, pageSize: PagePreset.web.pageSize, margin: 0,
-                                                 contentWidth: w, metadata: .init(title: title, author: nil, subject: finalURL.absoluteString))
+            let r = try await PageLayout.renderPDF(session: snap, pageSize: PagePreset.web.pageSize, margin: 0,
+                                                   contentWidth: w, metadata: .init(title: title, author: nil, subject: finalURL.absoluteString))
+            pdf = r.pdf
+            if r.truncated { notes.append("The page was very long, so only the first part was saved.") }
         }
 
         var epub: Data?
@@ -143,6 +147,8 @@ public enum WebConverter {
     /// them. Stops at the first frame the page won't answer for.
     static func captureFrames(_ page: WebSession, count: Int) async -> [Int: String] {
         var out: [Int: String] = [:]
+        var total = 0
+        let budget = 12 * 1024 * 1024
         for i in 0..<min(count, 16) {
             guard let json = try? await page.jsString("""
                 const f = document.querySelector('[data-ez-frame="\(i)"]');
@@ -157,13 +163,19 @@ public enum WebConverter {
                 return JSON.stringify([r.left + scrollX, r.top + scrollY, r.width, r.height]);
                 """, timeout: 4),
                   let a = try? JSONSerialization.jsonObject(with: Data(r.utf8)) as? [Double], a.count == 4 else { break }
-            let rect = CGRect(x: a[0], y: a[1], width: min(a[2], 1600), height: min(a[3], 2400))
+            guard a.allSatisfy(\.isFinite) else { break }
+            let rect = CGRect(x: a[0], y: a[1], width: min(a[2], 1400), height: min(a[3], 1800))
             guard let pdf = try? await page.pdf(rect: rect, timeout: 8),
-                  let png = PDFRaster.png(fromPDF: pdf, scale: 2) else { break }
-            out[i] = "data:image/png;base64," + png.base64EncodedString()
+                  let jpeg = PDFRaster.jpeg(fromPDF: pdf, scale: 1.5) else { break }
+            total += jpeg.count
+            if total > budget { break }       // enough charts; the rest are left out with a note
+            out[i] = "data:image/jpeg;base64," + jpeg.base64EncodedString()
         }
         return out
     }
+
+    /// Compiles the private-network block list (diagnostics).
+    public static func checkRules() async throws { _ = try await WebSession.ruleList() }
 
     // MARK: Article
 
@@ -182,14 +194,14 @@ public enum WebConverter {
     }
 
     /// Lays out an article (or any body HTML) for a preset and returns the PDF.
-    public static func renderArticle(_ article: Article, preset: PagePreset) async throws -> Data {
+    public static func renderArticle(_ article: Article, preset: PagePreset) async throws -> (pdf: Data, truncated: Bool) {
         try await renderHTMLBody(article.html, title: article.title, preset: preset, baseURL: article.sourceURL,
                                  header: ArticleHTML.header(for: article), author: article.byline,
                                  subject: article.sourceURL.absoluteString, lang: article.lang)
     }
 
     static func renderHTMLBody(_ body: String, title: String, preset: PagePreset, baseURL: URL?,
-                               header: String, author: String?, subject: String?, lang: String?) async throws -> Data {
+                               header: String, author: String?, subject: String?, lang: String?) async throws -> (pdf: Data, truncated: Bool) {
         let p = preset == .web ? PagePreset.letter : preset
         let html = ArticleHTML.document(body: body, header: header, title: title, preset: p, lang: lang)
         let layout = WebSession(width: p.contentSize.width, height: p.contentSize.height, javaScript: false)
@@ -331,6 +343,13 @@ public enum WebConverter {
       content: r.content, length: r.length
     });
     """
+}
+
+extension String {
+    /// The HTML with inline (data:) images removed, for storing on disk; the PDF already has them.
+    var strippingInlineImages: String {
+        replacingOccurrences(of: #"src=\"data:image/[^\"]{2048,}\""#, with: "src=\"\"", options: .regularExpression)
+    }
 }
 
 enum Scripts {

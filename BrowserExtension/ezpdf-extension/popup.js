@@ -41,7 +41,7 @@ async function start(flow, url) {
 
 function finish(s) {
   show($("progress"), false);
-  const ok = s.state === "done" || s.state === "launched";
+  const ok = s.state === "done";
   $("message").textContent = s.message || (ok ? "Done" : "Something went wrong.");
   $("message").classList.toggle("err", !ok);
   jobDoc = s.document || null; jobPath = s.path || null;
@@ -54,7 +54,7 @@ async function init() {
   if (tab) {
     $("title").textContent = tab.title || "This page";
     try { $("host").textContent = new URL(tab.url).host; } catch (e) { $("host").textContent = ""; }
-    $("launch").href = "ezpdf://convert?flow=open&url=" + encodeURIComponent(tab.url || "");
+    $("launch").href = "ezpdf://";
   }
   const saved = await ext.storage.local.get(["preset", "asSeen"]);
   $("asSeen").checked = !!saved.asSeen;
@@ -63,6 +63,7 @@ async function init() {
   $("status").className = "status " + (online ? "on" : "off");
   $("status").title = online ? "Connected to ezpdf" : "ezpdf isn't running";
   show($("offline"), !online);
+  if (online && h.paired === false) $("message").textContent = "";
   choosePreset(saved.preset || (h && h.preset) || "kindle");
   $("kindle").title = h && h.kindle === false ? "Add your Kindle address in ezpdf Settings first" : "Email to your Kindle";
 }

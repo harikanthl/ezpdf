@@ -7,7 +7,8 @@ import UniformTypeIdentifiers
 /// extract or split. Every action goes through EzPDF ops, so it's undoable and agent-equivalent.
 struct PagesView: View {
     let record: DocumentRecord
-    var onChange: () -> Void
+    /// Saves pending reader changes (highlights) before a page edit, so neither overwrites the other.
+    var beforeEdit: () -> Void
     @Environment(AppModel.self) private var app
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -16,7 +17,7 @@ struct PagesView: View {
     @State private var selected: Set<Int> = []
     @State private var anchor: Int?
     @State private var dropTarget: Int?
-    @State private var version = 0
+    @FocusState private var gridFocused: Bool
 
     private let columns = [GridItem(.adaptive(minimum: 132, maximum: 170), spacing: 18)]
 
@@ -29,19 +30,39 @@ struct PagesView: View {
                     ForEach(0..<count, id: \.self) { i in
                         pageCell(i)
                     }
+                    if count > 0 { endDropZone }
                 }
                 .padding(22)
             }
             .background(Color(nsColor: .underPageBackgroundColor))
-            .onTapGesture { selected = [] }
+            .onTapGesture { selected = []; gridFocused = true }
+            // Keys act on pages only while the grid has focus, never while typing in a field.
+            .focusable()
+            .focusEffectDisabled()
+            .focused($gridFocused)
+            .onDeleteCommand { if gridFocused { run(.delete) } }
+            .onKeyPress(characters: ["a"], phases: .down) { press in
+                guard gridFocused, press.modifiers == .command else { return .ignored }
+                selected = Set(0..<count)
+                return .handled
+            }
         }
         .task(id: "\(record.id)-\(record.modifiedAt.timeIntervalSince1970)") { await loadThumbs() }
-        .background {
-            Group {
-                Button("") { selected = Set(0..<count) }.keyboardShortcut("a")
-                Button("") { run(.delete) }.keyboardShortcut(.delete, modifiers: [])
-            }.opacity(0).allowsHitTesting(false)
-        }
+    }
+
+    /// Drop target after the last page, so pages can be moved to the end.
+    private var endDropZone: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(dropTarget == count ? Color.accentColor : Color.secondary.opacity(0.25), style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
+            .frame(height: 170)
+            .overlay(Text("Move to end").font(.caption).foregroundStyle(.secondary))
+            .padding(5)
+            .dropDestination(for: String.self) { items, _ in
+                guard let from = items.first.flatMap(Int.init) else { return false }
+                return move(from: from, to: count)
+            } isTargeted: { over in
+                withAnimation(reduceMotion ? nil : Motion.outFast) { dropTarget = over ? count : (dropTarget == count ? nil : dropTarget) }
+            }
     }
 
     private var spec: String { selected.sorted().map { "\($0 + 1)" }.joined(separator: ",") }
@@ -104,19 +125,14 @@ struct PagesView: View {
                 .foregroundStyle(isSelected ? .white : .secondary)
         }
         .contentShape(Rectangle())
-        .onTapGesture { click(i) }
         .onTapGesture(count: 2) { app.openPage = i + 1 }
+        .onTapGesture { click(i); gridFocused = true }
         .draggable("\(i)") {
             Image(nsImage: thumbs[i] ?? NSImage()).resizable().aspectRatio(contentMode: .fit).frame(height: 110).opacity(0.85)
         }
         .dropDestination(for: String.self) { items, _ in
             guard let from = items.first.flatMap(Int.init) else { return false }
-            let moving = selected.contains(from) ? selected.sorted() : [from]
-            let spec = moving.map { "\($0 + 1)" }.joined(separator: ",")
-            // Position i in the original order becomes this in the order without the moved pages.
-            let before = moving.filter { $0 < i }.count
-            perform { try app.ops.pages(record.id, action: .move, pages: spec, to: i - before + 1) }
-            return true
+            return move(from: from, to: i)
         } isTargeted: { over in
             withAnimation(reduceMotion ? nil : Motion.outFast) { dropTarget = over ? i : (dropTarget == i ? nil : dropTarget) }
         }
@@ -127,6 +143,21 @@ struct PagesView: View {
             Divider()
             Button("Delete", role: .destructive) { selectIfNeeded(i); run(.delete) }
         }
+    }
+
+    /// Moves the dragged page (or the selection it belongs to) so it starts before page `target`.
+    private func move(from: Int, to target: Int) -> Bool {
+        let moving = selected.contains(from) ? selected.sorted() : [from]
+        // Position `target` in the original order, counted without the pages being moved.
+        let before = moving.filter { $0 < target }.count
+        let newStart = target - before
+        // Dropping a block where it already is changes nothing; don't spend the undo on it.
+        if moving == Array(newStart..<(newStart + moving.count)) { return false }
+        let spec = moving.map { "\($0 + 1)" }.joined(separator: ",")
+        perform { try app.ops.pages(record.id, action: .move, pages: spec, to: newStart + 1) }
+        selected = Set(newStart..<(newStart + moving.count))
+        anchor = newStart
+        return true
     }
 
     private func selectIfNeeded(_ i: Int) { if !selected.contains(i) { selected = [i] } }
@@ -143,26 +174,37 @@ struct PagesView: View {
         }
     }
 
+    /// Renders thumbnails off the main thread on a private copy of the document, in batches,
+    /// stopping as soon as the view moves on.
     private func loadThumbs() async {
-        guard let doc = PDFDocument(url: Library.shared.pdfURL(for: record.id)) else { return }
+        let url = Library.shared.pdfURL(for: record.id)
+        guard let doc = PDFDocument(url: url) else { return }
         count = doc.pageCount
         selected = selected.filter { $0 < count }
         var fresh: [Int: NSImage] = [:]
-        for i in 0..<doc.pageCount {
-            guard let page = doc.page(at: i) else { continue }
-            fresh[i] = page.thumbnail(of: NSSize(width: 260, height: 340), for: .cropBox)
-            if i % 12 == 11 { thumbs = fresh; await Task.yield() }
+        let total = doc.pageCount
+        for start in stride(from: 0, to: total, by: 16) {
+            if Task.isCancelled { return }
+            let range = start..<min(start + 16, total)
+            let batch = await Task.detached(priority: .userInitiated) { () -> [(Int, NSImage)] in
+                guard let own = PDFDocument(url: url) else { return [] }
+                return range.compactMap { i in
+                    own.page(at: i).map { (i, $0.thumbnail(of: NSSize(width: 170, height: 220), for: .cropBox)) }
+                }
+            }.value
+            if Task.isCancelled { return }
+            for (i, img) in batch { fresh[i] = img }
+            thumbs = fresh
         }
-        thumbs = fresh
     }
 
     private func perform(_ body: () throws -> EzPDF.PageResult) {
+        beforeEdit()
         do {
             let r = try body()
             if !r.created.isEmpty {
                 app.show(r.created.count == 1 ? "Made “\(r.created[0].title)”" : "Made \(r.created.count) documents", documentID: r.created.first?.id)
             }
-            onChange()
         } catch { app.show(error.localizedDescription, error: true) }
     }
 
@@ -178,6 +220,7 @@ struct PagesView: View {
     }
 
     private func undo() {
-        do { _ = try app.ops.undo(record.id); onChange() } catch { app.show(error.localizedDescription, error: true) }
+        beforeEdit()
+        do { _ = try app.ops.undo(record.id) } catch { app.show(error.localizedDescription, error: true) }
     }
 }

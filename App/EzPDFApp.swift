@@ -13,11 +13,14 @@ struct EzPDFApp: App {
             ContentView()
                 .environment(app)
                 .frame(minWidth: 860, minHeight: 560)
+                // Links and files go to the window that's already open, not a new one.
+                .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
                 .onContinueUserActivity(CSSearchableItemActionType) { activity in
                     if let id = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String { app.selection = id }
                 }
         }
         .windowToolbarStyle(.unified)
+        .handlesExternalEvents(matching: ["*"])
         .commands { AppCommands(app: app) }
 
         Settings {
@@ -72,6 +75,8 @@ struct AppCommands: Commands {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Times of recent ezpdf:// conversions; links can come from any web page, so they're rate-limited.
+    private var recentLinkConversions: [Date] = []
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = ServiceProvider()
         NSUpdateDynamicServices()
@@ -91,11 +96,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let q = Dictionary(URLComponents(url: u, resolvingAgainstBaseURL: false)?.queryItems?.map { ($0.name, $0.value ?? "") } ?? [], uniquingKeysWith: { a, _ in a })
             switch u.host() {
             case "convert":
-                guard let raw = q["url"], let target = URL(string: raw), target.scheme?.hasPrefix("http") == true else { continue }
-                let flow: AppModel.Flow = q["flow"] == "kindle" ? .kindle : q["flow"] == "extract" ? .extract : .open
+                // Any web page can open an ezpdf:// link, so links never act silently: at most a few
+                // per minute, and sending email (Kindle) or reading data asks first.
+                guard let raw = q["url"], let target = URL(string: raw), target.scheme == "http" || target.scheme == "https" else { continue }
+                recentLinkConversions = recentLinkConversions.filter { $0.timeIntervalSinceNow > -60 }
+                guard recentLinkConversions.count < 3 else { app.show("Too many ezpdf links at once; ignored one.", error: true); continue }
+                recentLinkConversions.append(Date())
+                var flow: AppModel.Flow = q["flow"] == "kindle" ? .kindle : q["flow"] == "extract" ? .extract : .open
+                if flow != .open {
+                    NSApp.activate()
+                    let alert = NSAlert()
+                    alert.messageText = flow == .kindle ? "Send this page to your Kindle?" : "Make a PDF and read its data?"
+                    alert.informativeText = "A link asked ezpdf to \(flow == .kindle ? "email a PDF of" : "convert") \(target.host() ?? raw)."
+                    alert.addButton(withTitle: flow == .kindle ? "Send" : "Continue")
+                    alert.addButton(withTitle: "Just Make PDF")
+                    alert.addButton(withTitle: "Cancel")
+                    switch alert.runModal() {
+                    case .alertFirstButtonReturn: break
+                    case .alertSecondButtonReturn: flow = .open
+                    default: continue
+                    }
+                }
                 app.convert(url: target, preset: PagePreset.parse(q["preset"]), then: flow)
             case "open":
                 if let id = q["id"] { app.selection = id; app.openPage = Int(q["page"] ?? "") }
+            case "settings", "help":
+                app.settingsRequest = u.host() == "help" ? "help" : (q["tab"] ?? "general")
             default: break
             }
         }

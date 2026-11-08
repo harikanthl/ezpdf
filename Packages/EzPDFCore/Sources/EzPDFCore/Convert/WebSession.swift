@@ -9,7 +9,7 @@ final class WebSession: NSObject, WKNavigationDelegate {
         case blocked(String), loadFailed(String), timedOut
         var errorDescription: String? {
             switch self {
-            case .blocked(let u): return "ezpdf won't open \(u) (local-network and non-web addresses are blocked)."
+            case .blocked(let u): return "ezpdf won't open \(u) (addresses on your local network and non web links are blocked)."
             case .loadFailed(let d): return "The page didn't load: \(d)"
             case .timedOut: return "The page took too long to load."
             }
@@ -21,6 +21,11 @@ final class WebSession: NSObject, WKNavigationDelegate {
     let webView: WKWebView
     private let allowLocal: Bool
     private var loadContinuation: CheckedContinuation<Void, Error>?
+    /// Each load gets a number so a timer from an earlier load can't end a later one.
+    private var loadGeneration = 0
+    /// The one main-frame URL `loadHTML` may navigate to (its base URL), then nothing.
+    private var htmlBaseURL: URL?
+    private var rulesInstalled = false
     /// While false, the main frame may not navigate anywhere (layout documents, finished pages).
     private var navigationOpen = true
     private var committed = false
@@ -49,8 +54,27 @@ final class WebSession: NSObject, WKNavigationDelegate {
 
     // MARK: Loading
 
+    /// Blocks loads of private addresses for every resource type (images, fetch, scripts…).
+    /// Fails closed: if the block list can't be installed, nothing is loaded.
+    private func installRules() async throws {
+        guard !rulesInstalled, !allowLocal else { return }
+        guard let list = try await Self.ruleList() else { throw SessionError.loadFailed("network protection couldn't start") }
+        webView.configuration.userContentController.add(list)
+        rulesInstalled = true
+    }
+
+    private static var compiledRules: WKContentRuleList?
+    static func ruleList() async throws -> WKContentRuleList? {
+        if let compiledRules { return compiledRules }
+        let list = try await WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "ezpdf-private-network-v2", encodedContentRuleList: URLGuard.contentRules)
+        compiledRules = list
+        return list
+    }
+
     func load(_ url: URL, timeout: TimeInterval = 30) async throws {
         guard URLGuard.isAllowed(url, allowLocal: allowLocal) else { throw SessionError.blocked(url.absoluteString) }
+        guard await URLGuard.resolvesPublic(url, allowLocal: allowLocal) else { throw SessionError.blocked(url.absoluteString) }
+        try await installRules()
         var request = URLRequest(url: url)
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         navigationOpen = true
@@ -60,19 +84,25 @@ final class WebSession: NSObject, WKNavigationDelegate {
 
     /// Loads an HTML string whose main frame is then frozen: later navigations are refused.
     func loadHTML(_ html: String, baseURL: URL?, timeout: TimeInterval = 20) async throws {
-        navigationOpen = true
-        committed = false
-        try await waitForLoad(timeout: timeout) { self.webView.loadHTMLString(html, baseURL: baseURL) }
+        try await installRules()
         navigationOpen = false
+        htmlBaseURL = baseURL ?? URL(string: "about:blank")
+        committed = false
+        defer { htmlBaseURL = nil }
+        try await waitForLoad(timeout: timeout) { self.webView.loadHTMLString(html, baseURL: baseURL) }
     }
 
     private func waitForLoad(timeout: TimeInterval, start: @escaping () -> Void) async throws {
+        // A load still pending on this session is superseded, never left hanging.
+        resumeLoad(SessionError.loadFailed("superseded"))
+        loadGeneration += 1
+        let generation = loadGeneration
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             loadContinuation = c
             start()
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(timeout))
-                guard let self, self.loadContinuation != nil else { return }
+                guard let self, self.loadContinuation != nil, self.loadGeneration == generation else { return }
                 // A page that never fires didFinish (long polling, endless trackers) is still
                 // usable once it has committed; only a page that never arrived is an error.
                 if self.committed { self.resumeLoad(nil) } else { self.resumeLoad(SessionError.timedOut) }
@@ -99,6 +129,11 @@ final class WebSession: NSObject, WKNavigationDelegate {
             decisionHandler(.allow); return
         }
         guard let url = action.request.url else { decisionHandler(.cancel); return }
+        // loadHTML's own base URL is allowed once (the HTML is already here; nothing is fetched).
+        if let base = htmlBaseURL, url == base {
+            htmlBaseURL = nil
+            decisionHandler(.allow); return
+        }
         if !navigationOpen { decisionHandler(.cancel); return }
         if url.scheme == "about" || url.scheme == "data" { decisionHandler(.allow); return }
         if URLGuard.isAllowed(url, allowLocal: allowLocal) {

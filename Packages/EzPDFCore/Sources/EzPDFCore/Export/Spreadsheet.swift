@@ -13,8 +13,8 @@ public enum Spreadsheet {
             row.map { cell -> String in
                 // Leading = + - @ would run as formulas when opened in Excel; neutralize them.
                 var c = cell
-                if let f = c.first, "=+@".contains(f) || (f == "-" && Double(c) == nil) { c = "'" + c }
-                if c.contains(",") || c.contains("\"") || c.contains("\n") {
+                if let f = c.first, "=+@\t\r".contains(f) || (f == "-" && Double(c) == nil) { c = "'" + c }
+                if c.contains(",") || c.contains("\"") || c.contains("\n") || c.contains("\r") || c.contains("\r\n") {
                     return "\"" + c.replacingOccurrences(of: "\"", with: "\"\"") + "\""
                 }
                 return c
@@ -94,7 +94,8 @@ public enum Spreadsheet {
             xml += "<row r=\"\(r + 1)\">"
             for (c, value) in row.enumerated() where !value.isEmpty {
                 let ref = column(c) + String(r + 1)
-                if r > 0, value.range(of: #"^-?\d+(\.\d+)?$"#, options: .regularExpression) != nil, value.count < 16 {
+                // Numbers become numbers, except ones whose leading zeros matter ("00123", account numbers).
+                if r > 0, value.range(of: #"^-?(0|[1-9]\d*)(\.\d+)?$"#, options: .regularExpression) != nil, value.count < 16 {
                     let style = value.contains(".") ? " s=\"2\"" : ""
                     xml += "<c r=\"\(ref)\"\(style)><v>\(value)</v></c>"
                 } else {

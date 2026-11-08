@@ -146,3 +146,51 @@ import PDFKit
         #expect(h.contains("x &lt; y"))
     }
 }
+
+@Suite struct RegressionTests {
+    @Test func hugeRangesFailFastWithoutAllocating() throws {
+        #expect(throws: EzPDFError.self) { try PageOps.pages("1-99999999999", count: 10) }
+        #expect(throws: EzPDFError.self) { try PageOps.pages("0-3", count: 10) }
+        #expect(try PageOps.pages("-3", count: 10) == [0, 1, 2])          // "-3" means pages 1 to 3
+        #expect(throws: EzPDFError.self) { try PageOps.pages("99999999999-", count: 10) }
+    }
+
+    @Test func datesAreValidated() {
+        #expect(DateToken.parse("3.14", dayFirst: false) == nil)            // an amount, not March 14
+        #expect(DateToken.parse("02/31/2026", dayFirst: false) == nil)      // no Feb 31
+        #expect(DateToken.parse("12/31/99", dayFirst: false)?.year == 1999)
+        #expect(DateToken.parse("14.03.2026", dayFirst: true)?.month == 3)
+    }
+
+    @Test(arguments: ["http://0177.0.0.1/", "http://127.1/", "http://0x7f.0.0.1/", "http://[::127.0.0.1]/",
+                      "http://[64:ff9b::7f00:1]/", "http://010.0.0.1/"])
+    func numericHostsBlocked(_ s: String) { #expect(!URLGuard.isAllowed(URL(string: s)!)) }
+
+    @Test func localNamesResolveToPrivate() async {
+        #expect(await URLGuard.resolvesPublic(URL(string: "http://localtest.me/")!) == false)
+    }
+
+    @Test func requestParsingRejectsBadLengths() {
+        #expect(parse("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: -1\r\n\r\n") == 400)
+        #expect(parse("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n") == 411)
+        #expect(parse("POST /mcp HTTP/1.1\r\nHost: a\r\nHost: b\r\nContent-Length: 0\r\n\r\n") == 400)
+        #expect(parse("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 999999999999\r\n\r\n") == 413)
+        #expect(parse("POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\n\r\n{}") == 0)
+    }
+
+    @Test func csvQuotesCarriageReturns() {
+        let s = String(decoding: Spreadsheet.csv([["a\rb", "\t=1+1"]]), as: UTF8.self)
+        #expect(s.contains("\"a\rb\""))
+        #expect(s.contains("'\t=1+1"))
+    }
+
+    /// Runs RequestReader's parser over a buffer; 0 means a request was accepted.
+    func parse(_ raw: String) -> Int {
+        let r = RequestReader.testParse(Data(raw.utf8))
+        switch r {
+        case .request?: return 0
+        case .reject(let code, _)?: return code
+        case nil: return -1
+        }
+    }
+}

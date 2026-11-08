@@ -42,9 +42,8 @@ struct MakePDFFromLinkIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
         let rec = try await EzPDF.shared.convert(url: url, preset: preset.preset, source: .shortcut)
-        if sendToKindle { _ = try EzPDF.shared.sendToKindle(rec.id) }
-        let file = IntentFile(fileURL: Library.shared.pdfURL(for: rec.id), filename: "\(rec.title).pdf", type: .pdf)
-        return .result(value: file)
+        if sendToKindle { _ = try await EzPDF.shared.sendToKindle(rec.id) }
+        return .result(value: try IntentOutput.pdf(rec))
     }
 }
 
@@ -61,12 +60,14 @@ struct MakePDFFromFilesIntent: AppIntent {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let urls = try files.enumerated().map { i, f -> URL in
-            let u = dir.appendingPathComponent(String(format: "%03d-", i) + f.filename)
+            // Only the name part: a Shortcut-supplied "../x" can't write outside the temp folder.
+            let name = (f.filename as NSString).lastPathComponent
+            let u = dir.appendingPathComponent(String(format: "%03d ", i) + (name.isEmpty || name.hasPrefix(".") ? "file" : name))
             try f.data.write(to: u)
             return u
         }
         let rec = try await EzPDF.shared.convert(files: urls, preset: preset.preset, source: .shortcut)
-        return .result(value: IntentFile(fileURL: Library.shared.pdfURL(for: rec.id), filename: "\(rec.title).pdf", type: .pdf))
+        return .result(value: try IntentOutput.pdf(rec))
     }
 }
 
@@ -80,7 +81,8 @@ struct ExtractDataIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
-        let rec = try await EzPDF.shared.convert(data: file.data, fileName: file.filename.hasSuffix(".pdf") ? file.filename : file.filename + ".pdf", source: .shortcut)
+        let name = (file.filename as NSString).lastPathComponent
+        let rec = try await EzPDF.shared.convert(data: file.data, fileName: name.lowercased().hasSuffix(".pdf") ? name : name + ".pdf", source: .shortcut)
         let result = try await EzPDF.shared.extract(rec.id, kind: ExtractKind.parse(kind.rawValue), source: .shortcut)
         let url = try EzPDF.shared.saveExtraction(result, for: rec.id, format: format == .csv ? .csv : .xlsx)
         return .result(value: IntentFile(fileURL: url, filename: url.lastPathComponent, type: format == .csv ? .commaSeparatedText : UTType("org.openxmlformats.spreadsheetml.sheet") ?? .data))
@@ -96,8 +98,23 @@ struct SendLinkToKindleIntent: AppIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         let rec = try await EzPDF.shared.convert(url: url, preset: .kindle, format: .both, source: .shortcut)
-        let r = try EzPDF.shared.sendToKindle(rec.id)
+        let r = try await EzPDF.shared.sendToKindle(rec.id)
         return .result(dialog: "Sent “\(rec.title)” to your Kindle as \(r.format.rawValue.uppercased()).")
+    }
+}
+
+/// Files handed to Shortcuts are copies, so later actions can't change the library's own file.
+enum IntentOutput {
+    @MainActor
+    static func pdf(_ rec: DocumentRecord) throws -> IntentFile {
+        var name = rec.title.replacingOccurrences(of: "[/:\\\\?%*|\"<>\\p{Cc}]", with: " ", options: .regularExpression)
+        name = String(name.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "."))).prefix(90))
+        if name.isEmpty { name = "Document" }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ezpdf-out-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let copy = dir.appendingPathComponent("\(name).pdf")
+        try FileManager.default.copyItem(at: Library.shared.pdfURL(for: rec.id), to: copy)
+        return IntentFile(fileURL: copy, filename: copy.lastPathComponent, type: .pdf)
     }
 }
 

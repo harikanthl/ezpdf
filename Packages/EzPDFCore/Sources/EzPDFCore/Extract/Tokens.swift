@@ -61,7 +61,8 @@ public enum DateToken {
 
     static let months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
 
-    private static let numeric = try! NSRegularExpression(pattern: #"^(\d{1,2})[/\-.](\d{1,2})(?:[/\-.](\d{2,4}))?\b"#)
+    // "." as a separator only with a year (03.14.2026), so amounts like "3.14" aren't dates.
+    private static let numeric = try! NSRegularExpression(pattern: #"^(\d{1,2})(?:[/\-](\d{1,2})(?:[/\-](\d{2,4}))?|\.(\d{1,2})\.(\d{2,4}))\b"#)
     private static let iso = try! NSRegularExpression(pattern: #"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b"#)
     private static let dayMonth = try! NSRegularExpression(pattern: #"^(\d{1,2})(?:st|nd|rd|th)?[\s\-]?(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?(?:[\s\-,]+(\d{2,4}))?\b"#, options: .caseInsensitive)
     private static let monthDay = try! NSRegularExpression(pattern: #"^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s?(\d{1,2})(?:st|nd|rd|th)?(?:,?\s(\d{4}))?\b"#, options: .caseInsensitive)
@@ -75,25 +76,33 @@ public enum DateToken {
         }
         func year(_ y: String?) -> Int? {
             guard let y, let n = Int(y) else { return nil }
-            return n < 100 ? 2000 + n : n
+            if n >= 100 { return n }
+            return n <= 69 ? 2000 + n : 1900 + n      // POSIX pivot: 99 → 1999, 25 → 2025
+        }
+        func valid(_ y: Int?, _ m: Int, _ d: Int) -> Bool {
+            guard (1...12).contains(m), d >= 1 else { return false }
+            let days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+            if m == 2, let y, d == 29 { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+            return d <= days
         }
         func month(_ name: String) -> Int? {
             months.firstIndex(of: String(name.lowercased().prefix(3))).map { $0 + 1 }
         }
         if let m = iso.firstMatch(in: s, range: r), let y = Int(g(m, 1) ?? ""), let mo = Int(g(m, 2) ?? ""), let d = Int(g(m, 3) ?? ""),
-           (1...12).contains(mo), (1...31).contains(d) {
+           valid(y, mo, d) {
             return Parsed(year: y, month: mo, day: d, length: m.range.length)
         }
-        if let m = numeric.firstMatch(in: s, range: r), let a = Int(g(m, 1) ?? ""), let b = Int(g(m, 2) ?? "") {
+        if let m = numeric.firstMatch(in: s, range: r), let a = Int(g(m, 1) ?? ""), let b = Int(g(m, 2) ?? g(m, 4) ?? "") {
             var (mo, d) = dayFirst ? (b, a) : (a, b)
             if mo > 12, d <= 12 { swap(&mo, &d) }
-            guard (1...12).contains(mo), (1...31).contains(d) else { return nil }
+            let y = year(g(m, 3) ?? g(m, 5))
+            guard valid(y, mo, d) else { return nil }
+            return Parsed(year: y, month: mo, day: d, length: m.range.length)
+        }
+        if let m = dayMonth.firstMatch(in: s, range: r), let d = Int(g(m, 1) ?? ""), let mo = month(g(m, 2) ?? ""), valid(year(g(m, 3)), mo, d) {
             return Parsed(year: year(g(m, 3)), month: mo, day: d, length: m.range.length)
         }
-        if let m = dayMonth.firstMatch(in: s, range: r), let d = Int(g(m, 1) ?? ""), let mo = month(g(m, 2) ?? ""), (1...31).contains(d) {
-            return Parsed(year: year(g(m, 3)), month: mo, day: d, length: m.range.length)
-        }
-        if let m = monthDay.firstMatch(in: s, range: r), let mo = month(g(m, 1) ?? ""), let d = Int(g(m, 2) ?? ""), (1...31).contains(d) {
+        if let m = monthDay.firstMatch(in: s, range: r), let mo = month(g(m, 1) ?? ""), let d = Int(g(m, 2) ?? ""), valid(year(g(m, 3)), mo, d) {
             return Parsed(year: year(g(m, 3)), month: mo, day: d, length: m.range.length)
         }
         return nil

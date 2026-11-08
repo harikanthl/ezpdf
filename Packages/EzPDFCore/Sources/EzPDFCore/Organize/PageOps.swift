@@ -15,12 +15,16 @@ public enum PageOps {
             if p == "last" { out.append(count - 1); continue }
             let bits = p.split(separator: "-", omittingEmptySubsequences: false).map { $0.trimmingCharacters(in: .whitespaces) }
             if bits.count == 1, let n = Int(bits[0]) {
+                guard n >= 1, n <= count else { throw EzPDFError.invalidInput("Page \(n) doesn't exist; the document has \(count) pages.") }
                 out.append(n - 1)
             } else if bits.count == 2 {
                 let a = bits[0].isEmpty ? 1 : Int(bits[0])
                 let b = bits[1].isEmpty || bits[1] == "end" || bits[1] == "last" ? count : Int(bits[1])
-                guard let a, let b, a <= b else { throw EzPDFError.invalidInput("Bad page range “\(part)”.") }
+                guard let a, let b, a <= b, a >= 1 else { throw EzPDFError.invalidInput("Bad page range “\(part)”.") }
+                // Check bounds before building the range, so "1-99999999999" can't allocate.
+                guard b <= count else { throw EzPDFError.invalidInput("Page \(b) doesn't exist; the document has \(count) pages.") }
                 out.append(contentsOf: (a - 1)...(b - 1))
+                if out.count > 100_000 { throw EzPDFError.invalidInput("Too many pages in that range list.") }
             } else {
                 throw EzPDFError.invalidInput("Bad page range “\(part)”. Use forms like 1-3, 5, 8-.")
             }
@@ -57,6 +61,8 @@ public enum PageOps {
 
     /// Moves `pages` (keeping their order) so they start at 0-based position `to` of the result.
     public static func move(_ doc: PDFDocument, pages: [Int], to: Int) {
+        var seen = Set<Int>()
+        let pages = pages.filter { seen.insert($0).inserted }    // "1,1" would insert one page twice
         let set = Set(pages)
         let moving = pages.compactMap { doc.page(at: $0) }
         let staying = (0..<doc.pageCount).filter { !set.contains($0) }.compactMap { doc.page(at: $0) }

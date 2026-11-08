@@ -16,34 +16,46 @@ enum TopRelay {
     struct Failure: LocalizedError {
         let message: String
         let fix: String?
-        var errorDescription: String? { fix.map { "\(message) — \($0)" } ?? message }
+        var errorDescription: String? { fix.map { "\(message). \($0)" } ?? message }
     }
 
     @discardableResult
-    static func run(_ args: [String]) async throws -> [String: Any] {
+    static func run(_ args: [String], timeout: TimeInterval = 120) async throws -> [String: Any] {
         guard let bin = binary else {
             throw Failure(message: "TopRelay isn't installed", fix: "build it with `cd toprelay/agent && go build -o toprelay ./cmd/toprelay` and put it on your PATH")
         }
-        return try await Task.detached {
-            let p = Process()
-            p.executableURL = bin
-            p.arguments = args + ["--json"]
-            let out = Pipe(), err = Pipe()
-            p.standardOutput = out
-            p.standardError = err
-            try p.run()
-            let data = out.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
-            if let e = obj["error"] as? [String: Any] {
-                throw Failure(message: e["message"] as? String ?? "toprelay failed", fix: e["fix"] as? String)
-            }
-            if p.terminationStatus != 0 && obj.isEmpty {
-                let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                throw Failure(message: msg.isEmpty ? "toprelay exited with \(p.terminationStatus)" : msg, fix: nil)
-            }
-            return obj
-        }.value
+        // Output goes to temp files, not pipes: a chatty stderr or a child process that keeps a
+        // pipe open (up --install) can't hang ezpdf. Completion comes from the termination handler.
+        let tmp = FileManager.default.temporaryDirectory
+        let outURL = tmp.appendingPathComponent("ezpdf-toprelay-\(UUID().uuidString).out")
+        let errURL = tmp.appendingPathComponent("ezpdf-toprelay-\(UUID().uuidString).err")
+        FileManager.default.createFile(atPath: outURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        FileManager.default.createFile(atPath: errURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        defer { try? FileManager.default.removeItem(at: outURL); try? FileManager.default.removeItem(at: errURL) }
+        let outHandle = try FileHandle(forWritingTo: outURL)
+        let errHandle = try FileHandle(forWritingTo: errURL)
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = args + ["--json"]
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = outHandle
+        p.standardError = errHandle
+        let status: Int32 = try await withCheckedThrowingContinuation { c in
+            p.terminationHandler = { proc in c.resume(returning: proc.terminationStatus) }
+            do { try p.run() } catch { p.terminationHandler = nil; c.resume(throwing: error); return }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { if p.isRunning { p.terminate() } }
+        }
+        try? outHandle.close(); try? errHandle.close()
+        let data = (try? Data(contentsOf: outURL)) ?? Data()
+        let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        if let e = obj["error"] as? [String: Any] {
+            throw Failure(message: e["message"] as? String ?? "toprelay failed", fix: e["fix"] as? String)
+        }
+        if status != 0 && obj.isEmpty {
+            let msg = (try? String(contentsOf: errURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw Failure(message: msg.isEmpty ? "toprelay exited with \(status)" : String(msg.prefix(400)), fix: nil)
+        }
+        return obj
     }
 
     /// Registers ezpdf (or refreshes its token header). Read-only tools are exposed by default;

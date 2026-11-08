@@ -41,7 +41,8 @@ public final class Library: @unchecked Sendable {
     public static let shared = Library()
 
     public let root: URL
-    private let lock = NSLock()
+    /// Guards the cache and serializes read-modify-write operations (recursive: save() inside update()).
+    private let lock = NSRecursiveLock()
     private var cache: [String: DocumentRecord] = [:]
     private var loaded = false
 
@@ -87,12 +88,30 @@ public final class Library: @unchecked Sendable {
         return cache[id]
     }
 
-    /// Finds a document by exact id, or by a case-insensitive title match as a convenience for agents.
-    public func resolve(_ idOrTitle: String) -> DocumentRecord? {
-        if let r = record(idOrTitle) { return r }
-        let q = idOrTitle.lowercased()
+    public enum Match { case id(DocumentRecord), exactTitles([DocumentRecord]), partialTitles([DocumentRecord]), none }
+
+    /// How `idOrTitle` matches: an exact id, exact titles (case-insensitive), or titles containing it.
+    /// Callers decide what's unambiguous enough (see EzPDF.record).
+    public func matches(_ idOrTitle: String) -> Match {
+        let q = idOrTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return .none }
+        if let r = record(q) { return .id(r) }
+        let lower = q.lowercased()
         let docs = all()
-        return docs.first { $0.title.lowercased() == q } ?? docs.first { $0.title.lowercased().contains(q) }
+        let exact = docs.filter { $0.title.lowercased() == lower }
+        if !exact.isEmpty { return .exactTitles(exact) }
+        guard q.count >= 3 else { return .none }
+        let partial = docs.filter { $0.title.lowercased().contains(lower) }
+        return partial.isEmpty ? .none : .partialTitles(partial)
+    }
+
+    /// Convenience for the UI: exact id, or a unique title match.
+    public func resolve(_ idOrTitle: String) -> DocumentRecord? {
+        switch matches(idOrTitle) {
+        case .id(let r): return r
+        case .exactTitles(let rs) where rs.count == 1, .partialTitles(let rs) where rs.count == 1: return rs[0]
+        default: return nil
+        }
     }
 
     private func loadIfNeeded() {
@@ -133,9 +152,11 @@ public final class Library: @unchecked Sendable {
     /// Replaces a document's PDF (after page edits, compression, annotation...).
     @discardableResult
     public func replacePDF(_ id: String, with data: Data) throws -> DocumentRecord {
+        lock.lock(); defer { lock.unlock() }
         guard var rec = record(id) else { throw EzPDFError.notFound(id) }
+        guard let parsed = PDFDocument(data: data) else { throw EzPDFError.failed("Not a valid PDF; nothing was changed.") }
         try data.write(to: pdfURL(for: id), options: .atomic)
-        rec.pageCount = PDFDocument(data: data)?.pageCount ?? rec.pageCount
+        rec.pageCount = parsed.isLocked ? rec.pageCount : parsed.pageCount
         rec.byteCount = data.count
         rec.modifiedAt = Date()
         try save(rec)
@@ -151,6 +172,7 @@ public final class Library: @unchecked Sendable {
     }
 
     public func update(_ id: String, _ change: (inout DocumentRecord) -> Void) throws {
+        lock.lock(); defer { lock.unlock() }
         guard var rec = record(id) else { throw EzPDFError.notFound(id) }
         change(&rec)
         try save(rec)
@@ -158,9 +180,12 @@ public final class Library: @unchecked Sendable {
 
     public func save(_ record: DocumentRecord) throws {
         let data = try JSONEncoder.ezpdf.encode(record)
+        lock.lock(); defer { lock.unlock() }
+        // Load what's on disk first, or a write before any read would hide every other document.
+        loadIfNeeded()
         try FileManager.default.createDirectory(at: folder(for: record.id), withIntermediateDirectories: true)
         try data.write(to: metaURL(for: record.id), options: .atomic)
-        lock.lock(); cache[record.id] = record; loaded = true; lock.unlock()
+        cache[record.id] = record
         notify(record.id)
     }
 

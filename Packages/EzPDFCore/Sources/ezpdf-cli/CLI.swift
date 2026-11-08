@@ -34,6 +34,14 @@ enum CLI {
                 let t0 = Date()
                 print(try await EzPDF.shared.summarize(rec.id))
                 print("secs:", Int(Date().timeIntervalSince(t0)))
+            case "html":
+                // Renders a local HTML file through the web pipeline (tests the private-network block).
+                let html = try String(contentsOf: URL(fileURLWithPath: args[1]), encoding: .utf8)
+                let r = try await WebConverter.convert(html: html, url: URL(string: "https://example.com/")!, preset: .letter)
+                try r.pdf.write(to: URL(fileURLWithPath: args[2]))
+                print("pdf bytes: \(r.pdf.count) notes: \(r.notes)")
+            case "rules":
+                do { try await WebConverter.checkRules(); print("rules compiled") } catch { print("rules error:", error) }
             case "lines":
                 guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }
                 for l in await PageText.lines(doc) {

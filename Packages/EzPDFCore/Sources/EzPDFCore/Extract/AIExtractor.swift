@@ -72,14 +72,14 @@ enum AIExtractor {
         guard !chunks.isEmpty else { return "" }
         if chunks.count == 1 {
             let s = LanguageModelSession(instructions: "Summarize documents faithfully in plain English. Use short bullet points. No preamble.")
-            return try await s.respond(to: "Summarize in 5–8 bullets:\n\n\(chunks[0])").content
+            return try await s.respond(to: "Summarize in 5 to 8 bullets:\n\n\(chunks[0])").content
         }
         var notes: [String] = []
         for c in chunks {
             let s = LanguageModelSession(instructions: "Extract the key points of a document section. 3 short bullets. No preamble.")
             notes.append(try await s.respond(to: c).content)
         }
-        let s = LanguageModelSession(instructions: "Combine section notes into one faithful summary. Use 6–10 short bullets, most important first. No preamble.")
+        let s = LanguageModelSession(instructions: "Combine section notes into one faithful summary. Use 6 to 10 short bullets, most important first. No preamble.")
         return try await s.respond(to: notes.joined(separator: "\n")).content
     }
 

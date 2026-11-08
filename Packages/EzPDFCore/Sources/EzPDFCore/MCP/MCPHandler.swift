@@ -9,24 +9,33 @@ final class MCPHandler {
 
     init(ops: EzPDF) { tools = MCPTools.all(ops) }
 
-    func handle(_ req: HTTPRequest) async -> HTTPResponse {
+    static let maxBatch = 20
+
+    func handle(_ req: HTTPRequest, context: CallContext) async -> HTTPResponse {
         guard let json = req.json() else {
             return .json(400, rpcError(nil, -32700, "Parse error"))
         }
-        if let batch = json as? [[String: Any]] {
+        if let batch = json as? [Any] {
+            guard !batch.isEmpty, batch.count <= Self.maxBatch else {
+                return .json(400, rpcError(nil, -32600, batch.isEmpty ? "Empty batch" : "At most \(Self.maxBatch) requests per batch"))
+            }
             var out: [[String: Any]] = []
-            for m in batch { if let r = await message(m) { out.append(r) } }
+            for item in batch {
+                guard let m = item as? [String: Any] else { out.append(rpcError(nil, -32600, "Invalid request")); continue }
+                if let r = await message(m, context) { out.append(r) }
+            }
             return out.isEmpty ? HTTPResponse(status: 202, headers: [:], body: Data()) : .json(200, out)
         }
         guard let m = json as? [String: Any] else { return .json(400, rpcError(nil, -32600, "Invalid request")) }
-        guard let r = await message(m) else { return HTTPResponse(status: 202, headers: [:], body: Data()) }
+        guard let r = await message(m, context) else { return HTTPResponse(status: 202, headers: [:], body: Data()) }
         return .json(200, r)
     }
 
     /// Nil for notifications and responses (nothing to send back).
-    private func message(_ m: [String: Any]) async -> [String: Any]? {
+    private func message(_ m: [String: Any], _ context: CallContext) async -> [String: Any]? {
         let id = m["id"]
         guard let method = m["method"] as? String else { return nil }
+        guard m["jsonrpc"] as? String == "2.0" else { return id == nil ? nil : rpcError(id, -32600, "jsonrpc must be \"2.0\"") }
         if id == nil || id is NSNull { return nil }      // notification
         let params = m["params"] as? [String: Any] ?? [:]
         switch method {
@@ -49,7 +58,7 @@ final class MCPHandler {
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
             do {
-                let out = try await tool.run(args)
+                let out = try await tool.run(args, context)
                 return ok(id, out.json)
             } catch {
                 return ok(id, ToolOutput.error(error.localizedDescription).json)
@@ -104,7 +113,7 @@ struct MCPTool {
     var destructive = false
     var idempotent = false
     var openWorld = false
-    var run: ([String: Any]) async throws -> ToolOutput
+    var run: ([String: Any], CallContext) async throws -> ToolOutput
 
     var descriptor: [String: Any] {
         ["name": name, "title": title, "description": description, "inputSchema": schema,
@@ -135,7 +144,18 @@ extension Dictionary where Key == String, Value == Any {
         if let n = self[k] as? NSNumber { return n.stringValue }
         return nil
     }
-    func int(_ k: String) -> Int? { (self[k] as? NSNumber)?.intValue ?? (self[k] as? String).flatMap(Int.init) }
+    /// Integers from callers are untrusted: clamp to a sane range so they can't overflow or
+    /// make `prefix(-1)` trap.
+    func int(_ k: String, in range: ClosedRange<Int> = 0...1_000_000) -> Int? {
+        let raw: Int?
+        if let n = self[k] as? NSNumber {
+            let d = n.doubleValue
+            raw = d.isFinite ? Int(Swift.max(-1e9, Swift.min(1e9, d))) : nil
+        } else {
+            raw = (self[k] as? String).flatMap { Int($0) }
+        }
+        return raw.map { Swift.min(Swift.max($0, range.lowerBound), range.upperBound) }
+    }
     func bool(_ k: String) -> Bool? { (self[k] as? Bool) ?? (self[k] as? NSNumber)?.boolValue }
     func need(_ k: String) throws -> String {
         guard let v = str(k) else { throw EzPDFError.invalidInput("Missing “\(k)”.") }

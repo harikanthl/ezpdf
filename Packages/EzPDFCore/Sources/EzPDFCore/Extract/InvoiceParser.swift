@@ -59,9 +59,20 @@ public enum InvoiceParser {
             }
             return nil
         }
+        /// The first labelled value that is actually a date ("Amount due $500" matches "due" but
+        /// isn't one, so keep looking).
         func date(after pattern: String) -> String? {
-            guard let v = value(after: pattern), let d = DateToken.parse(v, dayFirst: dayFirst) else { return nil }
-            return DateToken.iso(d, fallbackYear: Calendar.current.component(.year, from: Date()))
+            let re = try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+            for (i, line) in lines.enumerated() {
+                let t = line.text
+                guard let m = re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)), let r = Range(m.range, in: t) else { continue }
+                var rest = String(t[r.upperBound...]).trimmingCharacters(in: CharacterSet(charactersIn: " :#.-\t"))
+                if rest.isEmpty, i + 1 < lines.count { rest = lines[i + 1].cells.first?.text ?? "" }
+                if let d = DateToken.parse(rest, dayFirst: dayFirst) {
+                    return DateToken.iso(d, fallbackYear: Calendar.current.component(.year, from: Date()))
+                }
+            }
+            return nil
         }
         func amount(after pattern: String, last: Bool = true) -> Double? {
             let re = try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
@@ -69,6 +80,8 @@ public enum InvoiceParser {
             for line in lines {
                 let t = line.text
                 guard re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil else { continue }
+                // "Subtotal (before tax)" mentions tax but isn't the tax line.
+                if pattern.contains("tax"), t.range(of: #"(?i)sub\s?-?total|before tax|excl"#, options: .regularExpression) != nil { continue }
                 if let cell = line.cells.last(where: { Money.isMoney($0.text) }) ?? StatementParser.splitTrailingAmounts(line.cells).last(where: { Money.isMoney($0.text) }),
                    let p = Money.parse(cell.text) {
                     found = p.value
