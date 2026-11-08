@@ -125,10 +125,15 @@ public enum AgentLoop {
                            outOfBudget: () -> Bool = { false },
                            steer: () -> [String] = { [] },
                            onText: (String) -> Void = { _ in },
-                           onToolCall: (LLMToolCall) -> Void = { _ in }) async throws -> Outcome {
+                           onToolCall: (LLMToolCall) -> Void = { _ in },
+                           onAppended: (LLMMessage) -> Void = { _ in }) async throws -> Outcome {
         let execute = executeOutput
         var transcript = messages
-        var appended: [LLMMessage] = []
+        // Every message the loop adds also goes to `onAppended` as it happens, so a caller whose run
+        // fails part way (network, provider error) still knows which tool calls already ran.
+        var appended: [LLMMessage] = [] {
+            didSet { if appended.count > oldValue.count { for m in appended[oldValue.count...] { onAppended(m) } } }
+        }
         var called: [String] = []
         var rounds = 0
         var spent: Usage?
@@ -144,9 +149,12 @@ public enum AgentLoop {
         }
 
         while rounds < max(1, maxRounds), rounds == 0 || !outOfBudget() {
+            // A cancelled stream ends quietly rather than throwing; don't take that as an answer.
+            try Task.checkCancellation()
             rounds += 1
             _ = takeSteering()
             let turn = try await one(round(transcript, tools), onText: onText)
+            try Task.checkCancellation()
             spent = add(spent, turn.usage)
             // No calls ⇒ it answered. The common case, and the one a plain chat has always taken. Unless the
             // person added something while it answered: then the answer stands and the loop goes round again.
@@ -188,6 +196,7 @@ public enum AgentLoop {
 
         // THE GRACE CALL. The budget is spent, so this one goes out with no tools: the model has
         // everything it fetched and must now say something. Its text streams like any other.
+        try Task.checkCancellation()
         let last = try await one(round(transcript, []), onText: onText)
         spent = add(spent, last.usage)
         return Outcome(rounds: rounds + 1, called: called, hitBudget: true, appended: appended,

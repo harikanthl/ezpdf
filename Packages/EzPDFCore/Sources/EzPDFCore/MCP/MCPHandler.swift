@@ -6,8 +6,9 @@ import Foundation
 final class MCPHandler {
     static let supportedVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
     let tools: [MCPTool]
+    let ops: EzPDF
 
-    init(ops: EzPDF) { tools = MCPTools.all(ops) }
+    init(ops: EzPDF) { self.ops = ops; tools = MCPTools.all(ops) }
 
     static let maxBatch = 20
 
@@ -57,10 +58,20 @@ final class MCPHandler {
                 return rpcError(id, -32602, "Unknown tool \(params["name"] as? String ?? "")")
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
+            if AgentApproval.needsApproval(tool, remote: context.isRemote) {
+                let request = AgentApproval.Request(client: context.client ?? "An agent", tool: tool.title,
+                                                    detail: AgentApproval.gist(args), remote: context.isRemote)
+                guard await AgentApproval.ask(request) else {
+                    return ok(id, ToolOutput.error("The user didn't allow \(tool.title.lowercased()) (or wasn't at the Mac to approve it). Ask them, then try again.").json)
+                }
+            }
+            let actor = EzPDF.Actor(by: context.client ?? "An agent", action: tool.title, detail: AgentApproval.gist(args))
             do {
-                let out = try await tool.run(args, context)
+                let out = try await EzPDF.$actor.withValue(actor) { try await tool.run(args, context) }
+                if out.isError { logFailure(tool, args, actor, out.text) }
                 return ok(id, out.json)
             } catch {
+                logFailure(tool, args, actor, error.localizedDescription)
                 return ok(id, ToolOutput.error(error.localizedDescription).json)
             }
         case "resources/list": return ok(id, ["resources": []])
@@ -68,6 +79,12 @@ final class MCPHandler {
         default:
             return rpcError(id, -32601, "Method not found: \(method)")
         }
+    }
+
+    /// A changing tool that failed goes in the document's log too (successes are logged as they save).
+    private func logFailure(_ tool: MCPTool, _ args: [String: Any], _ actor: EzPDF.Actor, _ message: String) {
+        guard !tool.readOnly, let doc = args["id"] as? String, let rec = try? ops.record(doc) else { return }
+        ops.log(rec.id, by: actor.by, action: actor.action, detail: actor.detail, ok: false, result: message)
     }
 
     private func ok(_ id: Any?, _ result: [String: Any]) -> [String: Any] {
@@ -160,5 +177,50 @@ extension Dictionary where Key == String, Value == Any {
     func need(_ k: String) throws -> String {
         guard let v = str(k) else { throw EzPDFError.invalidInput("Missing “\(k)”.") }
         return v
+    }
+}
+
+/// Outside agents (MCP clients) ask before they change or send documents. The in-app assistant
+/// has its own confirmation cards and doesn't come through here.
+public enum AgentApproval {
+    public struct Request: Sendable {
+        public let client: String
+        public let tool: String
+        public let detail: String
+        public let remote: Bool
+    }
+
+    public enum Policy: String, CaseIterable, Sendable {
+        case ask        // destructive changes and sending ask first; remote callers ask for any change
+        case allow      // agents on this Mac change documents without asking (remote callers still ask)
+    }
+
+    public static let policyKey = "ezpdf.agentApproval"
+    public static var policy: Policy {
+        Policy(rawValue: UserDefaults.standard.string(forKey: policyKey) ?? "") ?? .ask
+    }
+
+    /// Set by the app: shows the request and returns the answer. Without it (no app to ask), changes are refused.
+    @MainActor public static var handler: ((Request) async -> Bool)?
+
+    static func needsApproval(_ tool: MCPTool, remote: Bool) -> Bool {
+        if remote { return !tool.readOnly }
+        guard policy == .ask else { return false }
+        return tool.destructive || tool.name == "send_to_kindle"
+    }
+
+    @MainActor static func ask(_ r: Request) async -> Bool {
+        guard let handler else { return false }
+        return await handler(r)
+    }
+
+    /// The arguments in a line or two: long values shortened, images and secrets left out.
+    static func gist(_ args: [String: Any]) -> String {
+        args.keys.sorted().compactMap { k -> String? in
+            guard !["image_base64", "imageData", "logo_base64", "password"].contains(k), let v = args[k] else { return nil }
+            var s = (v as? String) ?? ((try? JSONSerialization.data(withJSONObject: v, options: [.fragmentsAllowed])).map { String(decoding: $0, as: UTF8.self) } ?? "\(v)")
+            if s.count > 80 { s = String(s.prefix(80)) + "…" }
+            return "\(k): \(s)"
+        }.prefix(8).joined(separator: "\n")
     }
 }

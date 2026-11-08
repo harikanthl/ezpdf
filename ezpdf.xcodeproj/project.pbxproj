@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		03438FC8AC0C556B49525FEE /* LogoGenerator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F4A6CC0B285BCACD68B08B1 /* LogoGenerator.swift */; };
+		04FDF97C8F3F0CCC8D138EDC /* ObjectClipboard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1571D2CE4D2FCB27F1A266D3 /* ObjectClipboard.swift */; };
 		05663FF3C39B801DFD0FEBEC /* EditablePDFView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6B0D580F172FA4C92E3E9464 /* EditablePDFView.swift */; };
 		08026653ED1BCF3425DEC249 /* ReaderView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03E9F5CD844F3EB2D7928A77 /* ReaderView.swift */; };
 		2778A4CDDC28582B324152AB /* AssistantModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03FF6B12809B3B9F2D663E6E /* AssistantModel.swift */; };
@@ -23,7 +24,9 @@
 		8BC8A0C73CEDB8D1CD4B85CB /* TemplatesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC992C082958F4CDEE1607B2 /* TemplatesView.swift */; };
 		A838D426684767237880053D /* Intents.swift in Sources */ = {isa = PBXBuildFile; fileRef = F460F38EB7E4EBDCA8FE5254 /* Intents.swift */; };
 		A9808F36831FD85EB2C40E06 /* AssistantPanel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 955A0FFF33B884498D588A67 /* AssistantPanel.swift */; };
+		A9CA8EE19DCE09A2EB5CA771 /* HistoryAndMemory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0420B81F00520568E26BCAC7 /* HistoryAndMemory.swift */; };
 		B606AC46412CA7C06A62C8B4 /* AssistantSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED1B61DB79046A015D05B525 /* AssistantSettings.swift */; };
+		BF3760269C83A6A06F3B4BC2 /* AgentApprovalPrompt.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD4FF9777FE2AE498057F4EB /* AgentApprovalPrompt.swift */; };
 		CAD8C3597DCBB8FAA29F0DF6 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CBB9F79A93B51F652BF1E8C /* ContentView.swift */; };
 		CD2DBB4A5F9B6B60D6B7F0F6 /* PagesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA85193B5373AFC0015B3968 /* PagesView.swift */; };
 		D51F0262DEE8F4728FAD64B7 /* EzPDFCore in Frameworks */ = {isa = PBXBuildFile; productRef = 302D7109B1C8911E923A4BBA /* EzPDFCore */; };
@@ -34,16 +37,19 @@
 		EE35EB79E5A8B113967F98B6 /* ChatSteering.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB1788A17A698A25A95A518F /* ChatSteering.swift */; };
 		F5B0CB1425E8A5A86D95FFD5 /* ReaderController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5BE760AC5BCEDEAD9285383F /* ReaderController.swift */; };
 		F98B327C3915651B203C5E3A /* ModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFE356F1371C58E5689364EA /* ModelCatalog.swift */; };
+		FAA9A9340F0F98382C2D1A36 /* QuickDecisionsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 807F79AABEDFC83CC0451477 /* QuickDecisionsSection.swift */; };
 		FCC9D685359FFC960F66AC36 /* EzPDFApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28F33F63C87EB71C76A0080B /* EzPDFApp.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		03E9F5CD844F3EB2D7928A77 /* ReaderView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReaderView.swift; sourceTree = "<group>"; };
 		03FF6B12809B3B9F2D663E6E /* AssistantModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantModel.swift; sourceTree = "<group>"; };
+		0420B81F00520568E26BCAC7 /* HistoryAndMemory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HistoryAndMemory.swift; sourceTree = "<group>"; };
 		0AA7D9655C69DC37C9503B15 /* Design.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Design.swift; sourceTree = "<group>"; };
 		0E27A36C6E8A77362614F3D9 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		13025C5D4ACD0902D981AAFB /* ExtractSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtractSheet.swift; sourceTree = "<group>"; };
 		142FB9525FFADF352C8B0528 /* VoiceFollower.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceFollower.swift; sourceTree = "<group>"; };
+		1571D2CE4D2FCB27F1A266D3 /* ObjectClipboard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObjectClipboard.swift; sourceTree = "<group>"; };
 		28F33F63C87EB71C76A0080B /* EzPDFApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EzPDFApp.swift; sourceTree = "<group>"; };
 		4F4A6CC0B285BCACD68B08B1 /* LogoGenerator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogoGenerator.swift; sourceTree = "<group>"; };
 		526BF01522FE0F00DD89FFAA /* ezpdf.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ezpdf.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -53,6 +59,7 @@
 		61437F89C4445416905CC669 /* EditTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditTools.swift; sourceTree = "<group>"; };
 		6B0D580F172FA4C92E3E9464 /* EditablePDFView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditablePDFView.swift; sourceTree = "<group>"; };
 		80581BE6BF39A8A2AB53AFD7 /* ModelsSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsSettings.swift; sourceTree = "<group>"; };
+		807F79AABEDFC83CC0451477 /* QuickDecisionsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickDecisionsSection.swift; sourceTree = "<group>"; };
 		83321855FC7E6D79B4C5B88B /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8CBB9F79A93B51F652BF1E8C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		8D23C8B599408839D99EEAB5 /* Dictation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Dictation.swift; sourceTree = "<group>"; };
@@ -68,6 +75,7 @@
 		EB1788A17A698A25A95A518F /* ChatSteering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatSteering.swift; sourceTree = "<group>"; };
 		ED1B61DB79046A015D05B525 /* AssistantSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AssistantSettings.swift; sourceTree = "<group>"; };
 		F460F38EB7E4EBDCA8FE5254 /* Intents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Intents.swift; sourceTree = "<group>"; };
+		FD4FF9777FE2AE498057F4EB /* AgentApprovalPrompt.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentApprovalPrompt.swift; sourceTree = "<group>"; };
 		FFE356F1371C58E5689364EA /* ModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelCatalog.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -113,9 +121,11 @@
 		52C9DFD0C65055472E3823F8 /* Support */ = {
 			isa = PBXGroup;
 			children = (
+				FD4FF9777FE2AE498057F4EB /* AgentApprovalPrompt.swift */,
 				B6F64335BBAE61562D77811D /* ezpdf.entitlements */,
 				0E27A36C6E8A77362614F3D9 /* Info.plist */,
 				FFE356F1371C58E5689364EA /* ModelCatalog.swift */,
+				1571D2CE4D2FCB27F1A266D3 /* ObjectClipboard.swift */,
 				93F9C909698BFF22D9D8A526 /* TopRelay.swift */,
 			);
 			path = Support;
@@ -130,9 +140,11 @@
 				6B0D580F172FA4C92E3E9464 /* EditablePDFView.swift */,
 				61437F89C4445416905CC669 /* EditTools.swift */,
 				13025C5D4ACD0902D981AAFB /* ExtractSheet.swift */,
+				0420B81F00520568E26BCAC7 /* HistoryAndMemory.swift */,
 				4F4A6CC0B285BCACD68B08B1 /* LogoGenerator.swift */,
 				80581BE6BF39A8A2AB53AFD7 /* ModelsSettings.swift */,
 				BA85193B5373AFC0015B3968 /* PagesView.swift */,
+				807F79AABEDFC83CC0451477 /* QuickDecisionsSection.swift */,
 				5BE760AC5BCEDEAD9285383F /* ReaderController.swift */,
 				03E9F5CD844F3EB2D7928A77 /* ReaderView.swift */,
 				A90947DE906DEA5D9A596CB6 /* SettingsView.swift */,
@@ -263,6 +275,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				BF3760269C83A6A06F3B4BC2 /* AgentApprovalPrompt.swift in Sources */,
 				E4F724E8DE04B30D4F2A62FD /* AppModel.swift in Sources */,
 				2778A4CDDC28582B324152AB /* AssistantModel.swift in Sources */,
 				A9808F36831FD85EB2C40E06 /* AssistantPanel.swift in Sources */,
@@ -275,11 +288,14 @@
 				05663FF3C39B801DFD0FEBEC /* EditablePDFView.swift in Sources */,
 				E3304949F2600773506C90A5 /* ExtractSheet.swift in Sources */,
 				FCC9D685359FFC960F66AC36 /* EzPDFApp.swift in Sources */,
+				A9CA8EE19DCE09A2EB5CA771 /* HistoryAndMemory.swift in Sources */,
 				A838D426684767237880053D /* Intents.swift in Sources */,
 				03438FC8AC0C556B49525FEE /* LogoGenerator.swift in Sources */,
 				F98B327C3915651B203C5E3A /* ModelCatalog.swift in Sources */,
 				E9403CE3D81D67DAF3DDA3C2 /* ModelsSettings.swift in Sources */,
+				04FDF97C8F3F0CCC8D138EDC /* ObjectClipboard.swift in Sources */,
 				CD2DBB4A5F9B6B60D6B7F0F6 /* PagesView.swift in Sources */,
+				FAA9A9340F0F98382C2D1A36 /* QuickDecisionsSection.swift in Sources */,
 				F5B0CB1425E8A5A86D95FFD5 /* ReaderController.swift in Sources */,
 				08026653ED1BCF3425DEC249 /* ReaderView.swift in Sources */,
 				686A184F2BFEB8A9FB150095 /* SettingsView.swift in Sources */,

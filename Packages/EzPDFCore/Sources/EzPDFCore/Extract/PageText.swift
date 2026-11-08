@@ -2,7 +2,7 @@ import Foundation
 import PDFKit
 import Vision
 
-/// A run of text with its position on the page (points, origin top-left).
+/// A run of text with its position on the page as shown (points, origin top-left, after rotation).
 public struct TextFragment: Sendable, Hashable {
     public var text: String
     public var rect: CGRect
@@ -39,28 +39,34 @@ public enum PageText {
     static func words(page: PDFPage, index: Int) -> [TextFragment] {
         guard let str = page.string, !str.isEmpty else { return [] }
         let ns = str as NSString
-        let box = page.bounds(for: .cropBox)
+        let space = EditOps.PageSpace(page)
         var out: [TextFragment] = []
         for m in wordPattern.matches(in: str, range: NSRange(location: 0, length: ns.length)) {
             guard let sel = page.selection(for: m.range) else { continue }
             let r = sel.bounds(for: page)
             guard !r.isEmpty, r.width.isFinite else { continue }
-            let flipped = CGRect(x: r.minX - box.minX, y: box.maxY - r.maxY, width: r.width, height: r.height)
-            out.append(TextFragment(text: ns.substring(with: m.range), rect: flipped, page: index))
+            out.append(TextFragment(text: ns.substring(with: m.range), rect: space.topLeft(r), page: index))
         }
         return out
     }
 
-    /// On-device OCR (Vision) for scanned pages. Each recognized text run becomes a fragment.
+    /// On-device OCR for scanned pages: Apple's document reader (words with their boxes), or plain
+    /// text recognition if that finds nothing.
     static func ocrFragments(page: PDFPage, index: Int) async -> [TextFragment] {
-        let bounds = page.bounds(for: .cropBox)
+        if let read = try? await DocumentReader.read(page: page, index: index), !read.words.isEmpty { return read.words }
+        return await recognizedLines(page: page, index: index)
+    }
+
+    /// Vision text recognition, line by line (the fallback reader).
+    static func recognizedLines(page: PDFPage, index: Int) async -> [TextFragment] {
+        let size = EditOps.PageSpace(page).size       // the render is the page as shown
         let scale: CGFloat = 2.5
         guard let image = PDFRaster.cgImage(page, scale: scale) else { return [] }
         var request = RecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
         guard let observations = try? await request.perform(on: image) else { return [] }
-        let w = bounds.width, h = bounds.height
+        let w = size.width, h = size.height
         return observations.compactMap { obs in
             guard let text = obs.topCandidates(1).first?.string, !text.isEmpty else { return nil }
             let n = obs.boundingBox.cgRect      // normalized, origin lower-left

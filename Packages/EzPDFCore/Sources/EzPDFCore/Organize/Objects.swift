@@ -46,19 +46,61 @@ public enum Objects {
         signatureFonts.lazy.compactMap { NSFont(name: $0, size: size) }.first ?? .systemFont(ofSize: size)
     }
 
+    // MARK: Fitting
+
+    /// FreeText inset, each side: text is drawn this far inside the object's box.
+    static let textInset: CGFloat = 4
+
+    /// Grows a text box (top-left shown points, top edge fixed) so the text is never clipped.
+    /// Script fonts swash below their nominal descender, so there's room for that; a signature
+    /// (single line, script font) grows sideways instead of wrapping. Stays on the page.
+    static func fitted(_ r: CGRect, text: String, font: NSFont, page: CGRect) -> CGRect {
+        let script = isSignatureFont(font)
+        let pad = textInset
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        var width = r.width
+        if script || !text.contains("\n") {
+            let line = (text as NSString).size(withAttributes: attrs).width + 2 * pad + (script ? font.pointSize * 0.3 : 2)
+            if script || line <= page.width { width = max(width, min(line, page.maxX - r.minX)) }
+        }
+        let need = (text as NSString).boundingRect(with: CGSize(width: max(8, width - 2 * pad), height: .greatestFiniteMagnitude),
+                                                   options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attrs)
+        let overhang = script ? font.pointSize * 0.35 : font.pointSize * 0.12   // swashes and descenders
+        let height = max(r.height, ceil(need.height + overhang + 2 * pad))
+        var out = CGRect(x: r.minX, y: r.minY, width: width, height: height)
+        if out.maxY > page.maxY { out.origin.y = max(page.minY, page.maxY - height) }   // keep it on the page
+        return out
+    }
+
+    /// Re-fits a placed text object after its words or font changed.
+    public static func refit(_ a: PDFAnnotation, on page: PDFPage) {
+        guard a.type == "FreeText", let font = a.font else { return }
+        let space = EditOps.PageSpace(page)
+        a.bounds = space.pageRect(fitted(space.topLeft(a.bounds), text: a.contents ?? "", font: font, page: space.bounds))
+    }
+
+    /// Keeps an object's box on its page (a drag or a page change can leave it off the edge, where
+    /// it can't be clicked but would still be printed).
+    public static func clampToPage(_ a: PDFAnnotation, on page: PDFPage) {
+        let space = EditOps.PageSpace(page)
+        var r = space.topLeft(a.bounds)
+        let b = space.bounds
+        r.size.width = min(r.width, b.width); r.size.height = min(r.height, b.height)
+        r.origin.x = min(max(r.minX, b.minX), b.maxX - r.width)
+        r.origin.y = min(max(r.minY, b.minY), b.maxY - r.height)
+        a.bounds = space.pageRect(r)
+    }
+
     // MARK: Creating
 
-    /// A text box (or typed signature) as an editable FreeText annotation.
+    /// A text box (or typed signature) as an editable FreeText annotation. `rect` is top-left
+    /// points of the page as shown.
     @discardableResult
     public static func addText(_ doc: PDFDocument, page index: Int, rect: CGRect, text: String, font: NSFont,
                                color: NSColor, alignment: NSTextAlignment = .left) throws -> String {
         guard let page = doc.page(at: index) else { throw EzPDFError.invalidInput("No page \(index + 1).") }
-        let crop = page.bounds(for: .cropBox)
-        var r = EditOps.pdfRect(rect, crop: crop)
-        // Grow the box to fit the text so nothing is clipped.
-        let need = (text as NSString).boundingRect(with: CGSize(width: r.width, height: .greatestFiniteMagnitude),
-                                                   options: [.usesLineFragmentOrigin], attributes: [.font: font])
-        if need.height + 4 > r.height { r.origin.y -= (need.height + 4 - r.height); r.size.height = need.height + 4 }
+        let space = EditOps.PageSpace(page)
+        let r = space.pageRect(fitted(rect, text: text, font: font, page: space.bounds))
         let a = PDFAnnotation(bounds: r, forType: .freeText, withProperties: nil)
         a.contents = text
         a.font = font
@@ -67,9 +109,10 @@ public enum Objects {
         a.alignment = alignment
         let border = PDFBorder(); border.lineWidth = 0
         a.border = border
-        let id = UUID().uuidString.lowercased()
+        let id = newID()
         a.userName = marker + id
         page.addAnnotation(a)
+        clampToPage(a, on: page)
         return id
     }
 
@@ -77,45 +120,54 @@ public enum Objects {
     @discardableResult
     public static func addImage(_ doc: PDFDocument, page index: Int, rect: CGRect, imageData: Data, folder: URL) throws -> String {
         guard let page = doc.page(at: index) else { throw EzPDFError.invalidInput("No page \(index + 1).") }
-        guard let src = CGImageSourceCreateWithData(imageData as CFData, nil),
-              let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                                                    kCGImageSourceCreateThumbnailWithTransform: true,
-                                                                    kCGImageSourceThumbnailMaxPixelSize: 3000] as CFDictionary),
-              let png = PDFRaster.encode(cg, type: .png) else { throw EzPDFError.invalidInput("That image couldn't be read.") }
-        let id = UUID().uuidString.lowercased()
+        guard let cg = PDFRaster.decodeImage(imageData), let png = PDFRaster.encode(cg, type: .png) else {
+            throw EzPDFError.invalidInput("That image couldn't be read. Use PNG, JPEG, HEIC, TIFF, GIF, WebP or SVG.")
+        }
+        let id = newID()
         let dir = folder.appendingPathComponent("objects", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try png.write(to: dir.appendingPathComponent("\(id).png"), options: .atomic)
-        let crop = page.bounds(for: .cropBox)
-        let fitted = EditOps.fit(cg, in: rect)
-        let a = ImageStampAnnotation(bounds: EditOps.pdfRect(fitted, crop: crop), image: cg)
+        let space = EditOps.PageSpace(page)
+        let a = ImageStampAnnotation(bounds: space.pageRect(EditOps.fit(cg, in: rect)), image: cg)
         a.contents = imageKey + id
         a.userName = marker + id
         page.addAnnotation(a)
+        clampToPage(a, on: page)
         return id
     }
 
+    static func newID() -> String { UUID().uuidString.lowercased() }
+
     // MARK: Loading
 
-    /// Turns saved image placeholders back into drawable image objects (after opening a document).
+    /// Turns saved objects back into drawable ones after opening a document: image placeholders
+    /// get their image, and text objects draw upright on rotated pages (PDFKit draws FreeText in
+    /// unrotated page space, so it would come out sideways).
     public static func hydrate(_ doc: PDFDocument, folder: URL) {
         for p in 0..<doc.pageCount {
             guard let page = doc.page(at: p) else { continue }
-            for a in page.annotations where !(a is ImageStampAnnotation) {
-                guard let contents = a.contents, contents.hasPrefix(imageKey), let id = objectID(a) else { continue }
-                let url = folder.appendingPathComponent("objects/\(id).png")
-                guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-                      let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
-                let img = ImageStampAnnotation(bounds: a.bounds, image: cg)
-                img.contents = contents
-                img.userName = a.userName
-                page.removeAnnotation(a)
-                page.addAnnotation(img)
+            for a in page.annotations where objectID(a) != nil && !(a is ImageStampAnnotation) && !(a is TextObjectAnnotation) {
+                if let contents = a.contents, contents.hasPrefix(imageKey), let id = objectID(a) {
+                    let url = folder.appendingPathComponent("objects/\(id).png")
+                    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                          let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+                    let img = ImageStampAnnotation(bounds: a.bounds, image: cg)
+                    img.contents = contents
+                    img.userName = a.userName
+                    page.removeAnnotation(a)
+                    page.addAnnotation(img)
+                } else if a.type == "FreeText", page.rotation % 360 != 0 {
+                    let t = TextObjectAnnotation(copying: a)
+                    page.removeAnnotation(a)
+                    page.addAnnotation(t)
+                }
             }
         }
     }
 
-    public static func find(_ doc: PDFDocument, id: String) -> (page: Int, annotation: PDFAnnotation)? {
+    /// The object with `id`, looked for first on `preferring` (0-based) when given.
+    public static func find(_ doc: PDFDocument, id: String, preferring: Int? = nil) -> (page: Int, annotation: PDFAnnotation)? {
+        if let p = preferring, let a = doc.page(at: p)?.annotations.first(where: { objectID($0) == id }) { return (p, a) }
         for p in 0..<doc.pageCount {
             if let a = doc.page(at: p)?.annotations.first(where: { objectID($0) == id }) { return (p, a) }
         }
@@ -126,10 +178,10 @@ public enum Objects {
         var out: [Info] = []
         for p in 0..<doc.pageCount {
             guard let page = doc.page(at: p) else { continue }
-            let crop = page.bounds(for: .cropBox)
+            let space = EditOps.PageSpace(page)
             for a in page.annotations {
                 guard let id = objectID(a) else { continue }
-                let r = EditOps.topLeftRect(a.bounds, crop: crop)
+                let r = space.topLeft(a.bounds)
                 let k = kind(a)
                 out.append(Info(id: id, kind: k, page: p + 1, rect: [r.minX, r.minY, r.width, r.height].map { (Double($0) * 10).rounded() / 10 },
                                 text: k == .image ? nil : a.contents, fontName: a.font?.fontName, fontSize: a.font.map { Double($0.pointSize) },
@@ -138,6 +190,9 @@ public enum Objects {
         }
         return out
     }
+
+    /// "#RRGGBB" for a color (sRGB).
+    public static func hexColor(_ c: NSColor) -> String { hex(c) }
 
     static func hex(_ c: NSColor) -> String {
         guard let s = c.usingColorSpace(.sRGB) else { return "#000000" }
@@ -150,30 +205,114 @@ public enum Objects {
         (0..<doc.pageCount).contains { p in doc.page(at: p)?.annotations.contains { objectID($0) != nil } ?? false }
     }
 
-    /// The document as it should leave ezpdf: images drawn into their pages, then every annotation
-    /// (text boxes, signatures, highlights, form values) burned in.
+    /// The document as it should leave ezpdf: placed text, signatures and images drawn into their
+    /// pages (upright, as shown). Everything else stays as it is: links, bookmarks, form fields
+    /// and markup (highlights, notes, shapes) still work for whoever receives it.
     public static func deliverable(_ doc: PDFDocument, folder: URL) throws -> Data {
+        var byPage: [Int: [EditOps.Overlay]] = [:]
         for p in 0..<doc.pageCount {
             guard let page = doc.page(at: p) else { continue }
-            let crop = page.bounds(for: .cropBox)
-            var overlays: [EditOps.Overlay] = []
+            let space = EditOps.PageSpace(page)
             for a in page.annotations {
-                guard let contents = a.contents, contents.hasPrefix(imageKey), let id = objectID(a) else { continue }
-                let url = folder.appendingPathComponent("objects/\(id).png")
-                if let src = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) {
-                    overlays.append(.image(cg, rect: EditOps.topLeftRect(a.bounds, crop: crop)))
+                guard let id = objectID(a) else { continue }
+                let r = space.topLeft(a.bounds)
+                if let contents = a.contents, contents.hasPrefix(imageKey) {
+                    let url = folder.appendingPathComponent("objects/\(id).png")
+                    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                        throw EzPDFError.failed("An image on page \(p + 1) is missing from the library, so the PDF wasn't made. Undo the last change or delete that image.")
+                    }
+                    byPage[p, default: []].append(.image(cg, rect: r))
+                    page.removeAnnotation(a)
+                } else if a.type == "FreeText" {
+                    let text = a.contents ?? ""
+                    if !text.isEmpty {
+                        byPage[p, default: []].append(.text(text, rect: r.insetBy(dx: textInset, dy: textInset), font: a.font ?? .systemFont(ofSize: 12),
+                                                            color: a.fontColor ?? .black, alignment: a.alignment))
+                    }
+                    page.removeAnnotation(a)
+                } else {
+                    // Boxes and other shapes are ordinary annotations: keep them, minus our tag.
+                    a.userName = nil
                 }
-                page.removeAnnotation(a)
             }
-            if !overlays.isEmpty { try EditOps.compose(doc, page: p, overlays: overlays) }
         }
-        guard let data = EditOps.flatten(doc) else { throw EzPDFError.failed("Couldn't prepare the PDF.") }
+        try EditOps.compose(doc, overlays: byPage)
+        guard let data = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't prepare the PDF.") }
         return data
+    }
+
+    // MARK: Copies and files
+
+    /// An image file an object needs in another (or the same) document's folder.
+    public struct ImageCopy: Sendable { public let from: URL; public let id: String }
+
+    /// Gives every object on `page` a new id (after the page was duplicated or copied into another
+    /// document, so two objects never share one) and returns the image files to copy for them.
+    public static func reassignIDs(on page: PDFPage, sourceFolder: URL) -> [ImageCopy] {
+        var copies: [ImageCopy] = []
+        for a in page.annotations {
+            guard let old = objectID(a) else { continue }
+            let id = newID()
+            a.userName = marker + id
+            if let contents = a.contents, contents.hasPrefix(imageKey) {
+                a.contents = imageKey + id
+                copies.append(ImageCopy(from: sourceFolder.appendingPathComponent("objects/\(old).png"), id: id))
+            }
+        }
+        return copies
+    }
+
+    public static func reassignIDs(_ doc: PDFDocument, sourceFolder: URL) -> [ImageCopy] {
+        (0..<doc.pageCount).flatMap { p in doc.page(at: p).map { reassignIDs(on: $0, sourceFolder: sourceFolder) } ?? [] }
+    }
+
+    /// Copies image files for `copies` into `folder`. A missing source is reported, not skipped.
+    public static func copyImages(_ copies: [ImageCopy], to folder: URL) throws {
+        guard !copies.isEmpty else { return }
+        let dir = folder.appendingPathComponent("objects", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for c in copies {
+            let dest = dir.appendingPathComponent("\(c.id).png")
+            guard FileManager.default.fileExists(atPath: c.from.path) else {
+                throw EzPDFError.failed("A placed image's file is missing (\(c.from.lastPathComponent)).")
+            }
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: c.from, to: dest)
+        }
+    }
+
+    /// The image ids a document refers to.
+    static func imageIDs(in doc: PDFDocument) -> Set<String> {
+        var ids = Set<String>()
+        for p in 0..<doc.pageCount {
+            for a in doc.page(at: p)?.annotations ?? [] {
+                if let c = a.contents, c.hasPrefix(imageKey) { ids.insert(String(c.dropFirst(imageKey.count))) }
+            }
+        }
+        return ids
+    }
+
+    /// Deletes image files no kept version uses (the current file and the undo copy), so deleting
+    /// an image can still be undone and nothing piles up.
+    public static func collectGarbage(folder: URL, versions: [URL]) {
+        let dir = folder.appendingPathComponent("objects", isDirectory: true)
+        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil),
+              files.contains(where: { $0.pathExtension == "png" }) else { return }
+        var keep = Set<String>()
+        for v in versions where FileManager.default.fileExists(atPath: v.path) {
+            // A version that can't be read keeps everything (never delete on doubt).
+            guard let doc = PDFDocument(url: v), !doc.isLocked else { return }
+            keep.formUnion(imageIDs(in: doc))
+        }
+        for f in files where f.pathExtension == "png" && !keep.contains(f.deletingPathExtension().lastPathComponent) {
+            try? FileManager.default.removeItem(at: f)
+        }
     }
 }
 
 /// Draws an image object. PDFKit saves it as a plain stamp with a pointer to the image file;
-/// `Objects.hydrate` turns it back into this when the document opens.
+/// `Objects.hydrate` turns it back into this when the document opens. Drawn upright as the page
+/// is shown.
 public final class ImageStampAnnotation: PDFAnnotation {
     public let image: CGImage
 
@@ -184,10 +323,54 @@ public final class ImageStampAnnotation: PDFAnnotation {
 
     required init?(coder: NSCoder) { nil }
 
+    /// PDFKit copies annotations (pages, documents); the copy must keep its image.
+    public override func copy(with zone: NSZone? = nil) -> Any {
+        let c = ImageStampAnnotation(bounds: bounds, image: image)
+        c.contents = contents
+        c.userName = userName
+        return c
+    }
+
     public override func draw(with box: PDFDisplayBox, in context: CGContext) {
         context.saveGState()
         context.interpolationQuality = .high
-        context.draw(image, in: bounds)
+        if let page {
+            let space = EditOps.PageSpace(page)
+            context.concatenate(space.toPage)
+            context.draw(image, in: bounds.applying(space.toShown))
+        } else {
+            context.draw(image, in: bounds)
+        }
+        context.restoreGState()
+    }
+}
+
+/// A placed text object on a rotated page, drawn upright as the page is shown (the same layout
+/// `deliverable` burns in). Saved as an ordinary FreeText annotation.
+public final class TextObjectAnnotation: PDFAnnotation {
+    public init(copying a: PDFAnnotation) {
+        super.init(bounds: a.bounds, forType: .freeText, withProperties: nil)
+        contents = a.contents
+        font = a.font
+        fontColor = a.fontColor
+        color = .clear
+        alignment = a.alignment
+        border = a.border
+        userName = a.userName
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    public override func copy(with zone: NSZone? = nil) -> Any { TextObjectAnnotation(copying: self) }
+
+    public override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        guard let page, let text = contents, !text.isEmpty else { return }
+        let space = EditOps.PageSpace(page)
+        context.saveGState()
+        context.concatenate(space.toPage)
+        let shown = bounds.applying(space.toShown).insetBy(dx: Objects.textInset, dy: Objects.textInset)
+        EditOps.drawText(text, in: shown, font: font ?? .systemFont(ofSize: 12), color: fontColor ?? .black,
+                         alignment: alignment, context: context)
         context.restoreGState()
     }
 }

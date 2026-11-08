@@ -63,13 +63,25 @@ enum CLI {
                 let wanted = AssistantToolbox.onDeviceTools
                 let specs = wanted.compactMap { toolbox.spec(named: $0) }.filter(\.flat).map { LLMToolSpec(name: $0.name, description: $0.description, parametersJSON: $0.schemaJSON) }
                 print("tools:", specs.map(\.name))
+                let readOnlyNames = Set(toolbox.specs.filter(\.readOnly).map(\.name))
                 let tools = OnDeviceToolBridge.tools(specs) { call in
                     let r = await toolbox.call(call.name, argumentsJSON: call.argumentsJSON, currentDocument: rec.id)
                     print("→ \(call.name) \(call.argumentsJSON)\n  \(r.ok ? "ok" : "ERR"): \(r.text.prefix(200))")
                     let t = r.text.count > 1500 ? String(r.text.prefix(1500)) + " [clipped]" : r.text
-                    return r.ok ? t : "Error: " + t
+                    let readOnly = readOnlyNames.contains(call.name)
+                    return r.ok ? (readOnly ? t : t + " Done. Now reply to the user in one sentence; don't call more tools unless they asked for more.") : "Error: " + t
                 }
-                let prompt = "User: \(args[2])\n[The open document is “\(rec.title)” (id \(rec.id)), \(rec.pageCount) pages; the user is looking at page 1.]"
+                // Optional 5th arg: words under a pen mark, sent the way the app's Mark & Talk does.
+                if args.count > 4, let edit = await AssistantToolbox.markEdit(marked: args[4], request: args[2], page: 1) {
+                    let json = String(decoding: try JSONSerialization.data(withJSONObject: ["find": edit.find, "replace": edit.replace, "pages": edit.pages, "match_case": true]), as: UTF8.self)
+                    let r = await toolbox.call("edit_text", argumentsJSON: json, currentDocument: rec.id)
+                    print("fast path → edit_text \(json)\n  \(r.ok ? "ok" : "ERR"): \(r.text)")
+                    try Data(contentsOf: EzPDF.shared.library.pdfURL(for: rec.id)).write(to: URL(fileURLWithPath: args[3]))
+                    _ = try? EzPDF.shared.delete(rec.id)
+                    return 0
+                }
+                let markNote = args.count > 4 ? "\n[The user pointed with the pen at these words on page 1: \"\(args[4])\". \"this\" means those words.]" : ""
+                let prompt = "User: \(args[2])\(markNote)\n[The open document is “\(rec.title)” (id \(rec.id)), \(rec.pageCount) pages; the user is looking at page 1.]"
                 var reply = ""
                 for try await d in OnDeviceLLM(instructions: AssistantToolbox.compactInstructions).streamText(prompt: prompt, tools: tools) { reply += d }
                 print("assistant:", reply)
@@ -105,6 +117,43 @@ enum CLI {
                 _ = try EzPDF.shared.stamp(rec.id, c)
                 try Data(contentsOf: EzPDF.shared.library.pdfURL(for: rec.id)).write(to: URL(fileURLWithPath: args[3]))
                 print("text:", (PDFDocument(url: URL(fileURLWithPath: args[3]))?.page(at: 0)?.string ?? "").prefix(80))
+            case "fonts":
+                // ezpdf-cli fonts <file.pdf>: the fonts it uses and how ezpdf makes each available.
+                guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }
+                for s in await Fonts.prepare(doc) { print("\(s.name): \(s.source.rawValue) — \(s.detail)") }
+            case "detect-form":
+                // ezpdf-cli detect-form <form.pdf> [out.pdf]: the blanks found. If the PDF is already fillable,
+                // its fields are taken off first and compared with what's found (how many real fields were found).
+                guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }
+                var truth: [(page: Int, rect: CGRect, checkbox: Bool)] = []
+                for p in 0..<doc.pageCount {
+                    guard let page = doc.page(at: p) else { continue }
+                    let space = EditOps.PageSpace(page)
+                    for a in page.annotations where a.type == "Widget" {
+                        if a.widgetFieldType == .text || a.widgetFieldType == .button && a.widgetControlType == .checkBoxControl {
+                            truth.append((p, space.topLeft(a.bounds), a.widgetFieldType == .button))
+                        }
+                        page.removeAnnotation(a)
+                    }
+                }
+                let t0 = Date()
+                let fields = await FormDetector.detect(doc)
+                print(String(format: "%d fields in %.2fs", fields.count, Date().timeIntervalSince(t0)))
+                for f in fields { print(String(format: "  p%d %-10@ %-28@ %@", f.page + 1, f.kind.rawValue as NSString, f.name as NSString, "\(f.rect.integral)" as NSString)) }
+                if !truth.isEmpty {
+                    func hit(_ t: (page: Int, rect: CGRect, checkbox: Bool)) -> Bool {
+                        fields.contains { $0.page == t.page && ($0.kind == .checkbox) == t.checkbox
+                            && (t.rect.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) || $0.rect.contains(CGPoint(x: t.rect.midX, y: t.rect.midY))) }
+                    }
+                    let found = truth.filter(hit).count
+                    let extra = fields.filter { f in !truth.contains { $0.page == f.page && ($0.rect.contains(CGPoint(x: f.rect.midX, y: f.rect.midY)) || f.rect.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY))) } }.count
+                    print("real fields: \(truth.count) (\(truth.filter(\.checkbox).count) checkboxes), found: \(found) (\(Int(Double(found) / Double(truth.count) * 100))%), extra: \(extra)")
+                    for t in truth where !hit(t) { print("  missed p\(t.page + 1) \(t.checkbox ? "checkbox" : "text") \(t.rect.integral)") }
+                }
+                if args.count > 2 {
+                    FormDetector.addFields(fields, to: doc)
+                    try doc.dataRepresentation()?.write(to: URL(fileURLWithPath: args[2]))
+                }
             case "templates":
                 // Renders every template to a folder (and fills a couple of fields in the invoice).
                 let dir = URL(fileURLWithPath: args[1])
@@ -124,11 +173,11 @@ enum CLI {
                 let imgs = try await ImageGen.generate(prompt: ImageGen.prompt(args[1], style: .minimal), model: model, count: 1)
                 for (i, d) in imgs.enumerated() {
                     try d.write(to: URL(fileURLWithPath: args[2]).appendingPathComponent("logo\(i).png"))
-                    if let cut = try? ImageGen.removeBackground(d) { try cut.write(to: URL(fileURLWithPath: args[2]).appendingPathComponent("logo\(i)-cut.png")) }
+                    if let cut = try? await ImageGen.removeBackground(d) { try cut.write(to: URL(fileURLWithPath: args[2]).appendingPathComponent("logo\(i)-cut.png")) }
                 }
                 print("images:", imgs.count, "secs:", Int(Date().timeIntervalSince(t0)))
             case "cutout":
-                try ImageGen.removeBackground(Data(contentsOf: URL(fileURLWithPath: args[1]))).write(to: URL(fileURLWithPath: args[2]))
+                try await ImageGen.removeBackground(Data(contentsOf: URL(fileURLWithPath: args[1]))).write(to: URL(fileURLWithPath: args[2]))
                 print("ok")
             case "lines":
                 guard let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { return 2 }

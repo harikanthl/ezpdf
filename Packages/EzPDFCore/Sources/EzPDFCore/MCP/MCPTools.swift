@@ -232,10 +232,16 @@ enum MCPTools {
                     ], required: ["id", "find", "replace"]),
                     readOnly: false, destructive: true) { a, ctx in
                 guard let find = a["find"] as? String, !find.isEmpty, let rep = a["replace"] as? String else { throw EzPDFError.invalidInput("Give find and replace.") }
+                // The new words go in the document's own font: make sure it's here first.
+                await ops.prepareFonts(try a.need("id"))
                 let r = try ops.replaceText(try a.need("id"), find: find, with: rep, pages: a.str("pages"),
                                             matchCase: a.bool("match_case") ?? false, wholeWord: a.bool("whole_word") ?? false)
                 let pages = Set(r.changes.map(\.page)).sorted().map(String.init).joined(separator: ", ")
-                return ToolOutput(text: "Changed \(r.changes.count) place\(r.changes.count == 1 ? "" : "s") on page\(r.changes.count == 1 ? "" : "s") \(pages). The new words are drawn over the old ones; the old text is still in the file underneath, so use redact if it must be gone for good.", structured: doc(r.record))
+                // What the edit checks adjusted or noticed, once each.
+                var notes: [String] = []
+                for n in r.changes.flatMap(\.notes) where !notes.contains(n) { notes.append(n) }
+                let applied = Set(r.changes.map(\.new)).count == 1 && r.changes[0].new != rep ? " as “\(r.changes[0].new)”" : ""
+                return ToolOutput(text: "Changed \(r.changes.count) place\(r.changes.count == 1 ? "" : "s") on page\(r.changes.count == 1 ? "" : "s") \(pages)\(applied)." + (notes.isEmpty ? "" : " Notes: " + notes.prefix(6).joined(separator: " ")), structured: doc(r.record))
             },
 
             MCPTool(name: "add_content", title: "Add text, image, signature or box",
@@ -342,18 +348,94 @@ enum MCPTools {
             },
 
             MCPTool(name: "create_from_template", title: "New document from a template",
-                    description: "Make a new fillable document from a ready-made template: invoice, receipt, quote, purchase_order, packing_slip, letter, cover_letter, resume, nda, bill_of_sale, rental, timesheet, expense_report, minutes, vendor_form, job_application, consent, permission_slip, certificate, event_registration. Call with template only to create it blank, then use fill_form to fill it (fill_form with no values lists the fields).",
+                    description: "Make a new fillable document from a template: a ready-made one (invoice, receipt, quote, purchase_order, packing_slip, letter, cover_letter, resume, nda, bill_of_sale, rental, timesheet, expense_report, minutes, vendor_form, job_application, consent, permission_slip, certificate, event_registration) or one the user saved (call with template \"list\" to see saved ones and their fields). Call with template only to create it blank, then use fill_form to fill it (fill_form with no values lists the fields).",
                     schema: S.object([
-                        "template": S.string("Template id", enum: DocTemplate.all.map(\.id)),
+                        "template": S.string("Template id, a saved template's name or id, or \"list\""),
                         "title": S.string("Title for the new document"),
                         "values": ["description": "Optional field values (object), see fill_form", "type": ["object", "string"]],
                     ], required: ["template"]),
                     readOnly: false) { a, ctx in
-                guard let t = DocTemplate.find(try a.need("template")) else { throw EzPDFError.invalidInput("Unknown template.") }
+                let name = try a.need("template")
+                if name.lowercased() == "list" {
+                    let saved = ops.userTemplates()
+                    let lines = saved.prefix(50).map { "- \($0.name) (id \($0.id)), \($0.pageCount) page(s), fields: \($0.fields.prefix(30).joined(separator: ", "))" }
+                    return ToolOutput(text: saved.isEmpty ? "No saved templates yet. Ready-made: \(DocTemplate.all.map(\.id).joined(separator: ", "))."
+                                                          : "Saved templates:\n" + lines.joined(separator: "\n"))
+                }
                 var values: [String: String] = [:]
                 if let obj = a["values"] as? [String: Any] { for (k, v) in obj.prefix(500) { values[k] = (v as? String) ?? "\(v)" } }
-                let rec = try await ops.create(template: t, values: values, title: a.str("title"), source: .agent)
-                return ToolOutput(text: "Created \(line(rec)) from the \(t.name) template. Fields: \(t.fieldNames.prefix(40).joined(separator: ", "))\(t.fieldNames.count > 40 ? ", …" : "").", structured: doc(rec))
+                if let t = DocTemplate.find(name) {
+                    let rec = try await ops.create(template: t, values: values, title: a.str("title"), source: .agent)
+                    return ToolOutput(text: "Created \(line(rec)) from the \(t.name) template. Fields: \(t.fieldNames.prefix(40).joined(separator: ", "))\(t.fieldNames.count > 40 ? ", …" : "").", structured: doc(rec))
+                }
+                guard let saved = ops.userTemplate(name) else {
+                    throw EzPDFError.invalidInput("No template “\(name)”. Use a ready-made id, or template \"list\" for saved ones.")
+                }
+                let rec = try ops.create(userTemplate: saved.id, title: a.str("title"), values: values, source: .agent)
+                return ToolOutput(text: "Created \(line(rec)) from the saved template “\(saved.name)”. Fields: \(saved.fields.prefix(40).joined(separator: ", "))\(saved.fields.count > 40 ? ", …" : "").", structured: doc(rec))
+            },
+
+            MCPTool(name: "memory", title: "Remember",
+                    description: "What to remember about the person across conversations: preferences and facts they want kept (\"sign as Hari L.\", \"dates as DD/MM/YYYY\", \"my company is Northwind Design\"). action get lists the notes; remember saves text (only things they said to remember, or clear lasting preferences, never secrets or account numbers); forget removes notes by id or by matching text.",
+                    schema: S.object([
+                        "action": S.string("get, remember or forget", enum: ["get", "remember", "forget"]),
+                        "text": S.string("remember: the note (under 300 characters); forget: text to match"),
+                        "note_id": S.string("forget: the note's id"),
+                    ], required: ["action"]),
+                    readOnly: false) { a, ctx in
+                switch a.str("action") {
+                case "get":
+                    let notes = ops.memory()
+                    guard !notes.isEmpty else { return ToolOutput(text: "Nothing remembered yet.") }
+                    return ToolOutput(text: notes.reversed().map { "- \($0.text) (id \($0.id), from \($0.source))" }.joined(separator: "\n"))
+                case "remember":
+                    let n = try ops.remember(try a.need("text"), source: ctx.client ?? "an agent")
+                    return ToolOutput(text: "Remembered: \(n.text)")
+                case "forget":
+                    let gone = try ops.forget(id: a.str("note_id"), matching: a.str("text"))
+                    return ToolOutput(text: "Forgot: " + gone.map(\.text).joined(separator: "; "))
+                default:
+                    throw EzPDFError.invalidInput("action is get, remember or forget.")
+                }
+            },
+
+            MCPTool(name: "document_history", title: "Document history",
+                    description: "What happened to a document: each change with who made it (the person, the ezpdf assistant, or which agent), what it was, and whether it worked. Newest first.",
+                    schema: S.object(["id": S.string("Document id or title"), "limit": S.int("How many (default 30)")], required: ["id"]),
+                    readOnly: true) { a, ctx in
+                let events = try ops.history(try a.need("id"), limit: a.int("limit", in: 1...500) ?? 30)
+                guard !events.isEmpty else { return ToolOutput(text: "No changes recorded yet.") }
+                let f = ISO8601DateFormatter()
+                return ToolOutput(text: events.map { e in
+                    "- \(f.string(from: e.at)) \(e.by): \(e.action)\(e.ok ? "" : " (failed: \(e.result))")\(e.detail.isEmpty ? "" : " — " + e.detail.replacingOccurrences(of: "\n", with: "; "))"
+                }.joined(separator: "\n"))
+            },
+
+            MCPTool(name: "fonts", title: "Document fonts",
+                    description: "List the fonts a document uses and whether edits can use them: on this Mac, taken from the document, or fetched (open-licensed families from the Google Fonts collection; Calibri and Cambria get their same-width open twins). Fetching happens automatically before edits; call with fetch true to do it now or again.",
+                    schema: S.object(["id": S.string("Document id or title"), "fetch": S.bool("Fetch missing open fonts again now")], required: ["id"]),
+                    readOnly: true, openWorld: true) { a, ctx in
+                let status = await ops.prepareFonts(try a.need("id"), force: a.bool("fetch") ?? false)
+                guard !status.isEmpty else { return ToolOutput(text: "No fonts found in that document (it may be scanned images).") }
+                let text = status.map { "- \($0.name): \($0.source.rawValue). \($0.detail)" }.joined(separator: "\n")
+                return ToolOutput(text: "Fonts:\n" + text)
+            },
+
+            MCPTool(name: "make_fillable", title: "Make a form fillable",
+                    description: "Turn a printed or scanned form into a fillable one: finds the writing lines, boxes, table cells, checkboxes and signature/date lines and adds a named form field for each (named after its label, e.g. full_name). Existing fields are kept. Optionally saves the result as a reusable template. Then fill it with fill_form. Changes the document (undo_last_edit reverts).",
+                    schema: S.object([
+                        "id": S.string("Document id or title"),
+                        "save_as_template": S.string("Also keep it in My Templates under this name"),
+                    ], required: ["id"]),
+                    readOnly: false) { a, ctx in
+                let r = try await ops.makeFillable(try a.need("id"))
+                var text = "Added \(r.fields.count) fields to \(line(r.record)): " + r.fields.prefix(60).map { "\($0.name) (\($0.kind.rawValue), page \($0.page + 1))" }.joined(separator: ", ")
+                if !r.skippedRotated.isEmpty { text += ". Rotated pages with annotations were left as they were: \(r.skippedRotated.map(String.init).joined(separator: ", "))." }
+                if let name = a.str("save_as_template"), !name.isEmpty {
+                    let t = try ops.saveTemplate(r.record.id, name: name)
+                    text += " Saved as the template “\(t.name)”."
+                }
+                return ToolOutput(text: text, structured: doc(r.record))
             },
 
             MCPTool(name: "generate_logo", title: "Generate a logo or image",
@@ -368,12 +450,17 @@ enum MCPTools {
                     ], required: ["id", "prompt"]),
                     readOnly: false, destructive: true, openWorld: true) { a, ctx in
                 guard !ctx.isRemote else { throw EzPDFError.invalidInput("Image generation uses the user's own keys, so it's only available from this Mac.") }
+                // Paid calls on the user's key: at most a few a minute, whoever asks.
+                guard LogoRate.allow() else { throw EzPDFError.invalidInput("Several logos were just made; wait a minute before making more.") }
                 let model = ImageGen.model(id: UserDefaults.standard.string(forKey: "ezpdf.logoModel"))
+                if model.provider == .apple, !NSApplication.shared.isActive {
+                    throw EzPDFError.invalidInput("Image Playground only works while ezpdf is in front. Bring ezpdf forward, or pick a fal.ai, OpenAI or OpenRouter model in ezpdf Settings › Models.")
+                }
                 let style = a.str("style").flatMap(ImageGen.Style.init(rawValue:)) ?? .minimal
                 guard let raw = try await ImageGen.generate(prompt: ImageGen.prompt(try a.need("prompt"), style: style), model: model, count: 1).first else {
                     throw EzPDFError.failed("No image came back.")
                 }
-                let png = (try? ImageGen.removeBackground(raw)) ?? raw
+                let png = (try? await ImageGen.removeBackground(raw, lettering: style.isLettering)) ?? raw
                 let w = a.int("width", in: 20...600) ?? 110
                 let rec = try ops.addContent(try a.need("id"), .init(kind: .image, page: a.int("page", in: 1...100_000) ?? 1,
                     rect: CGRect(x: a.int("x", in: 0...5000) ?? 48, y: a.int("y", in: 0...5000) ?? 40, width: w, height: w), imageData: png))
@@ -472,7 +559,7 @@ enum MCPTools {
                     description: "open: show the document in the ezpdf window (optionally at a page). rename: change its title. properties: set the PDF's title, author, subject, keywords. undo_last_edit: revert the last change. delete: move it to the Trash.",
                     schema: S.object([
                         "id": S.string("Document id or title"),
-                        "action": S.string("What to do", enum: ["open", "rename", "properties", "undo_last_edit", "delete"]),
+                        "action": S.string("What to do", enum: ["open", "rename", "properties", "undo_last_edit", "redo_last_edit", "delete"]),
                         "title": S.string("rename/properties: new title"),
                         "author": S.string("properties: author"), "subject": S.string("properties: subject"),
                         "keywords": S.string("properties: comma-separated keywords"),
@@ -487,7 +574,8 @@ enum MCPTools {
                     let r = try ops.setProperties(id, title: a.str("title"), author: a.str("author"), subject: a.str("subject"),
                                                   keywords: a.str("keywords").map { $0.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } })
                     return ToolOutput(text: "Updated the properties of “\(r.title)”.", structured: doc(r))
-                case "undo_last_edit": let r = try ops.undo(id); return ToolOutput(text: "Restored the previous version of “\(r.title)”.", structured: doc(r))
+                case "undo_last_edit": let r = try ops.undo(id); return ToolOutput(text: "Restored the previous version of “\(r.title)”. Undo again to go further back; redo_last_edit puts the change back.", structured: doc(r))
+                case "redo_last_edit": let r = try ops.redo(id); return ToolOutput(text: "Put back the change that was undone in “\(r.title)”.", structured: doc(r))
                 case "delete": let r = try ops.delete(id); return ToolOutput(text: "Moved “\(r.title)” to the Trash.", structured: ["id": r.id])
                 default: throw EzPDFError.invalidInput("Unknown action.")
                 }
@@ -531,5 +619,17 @@ enum MCPTools {
         }
         if let saved { text += "\n\nSaved to \(saved.path)"; structured["saved_path"] = saved.path }
         return ToolOutput(text: text, structured: structured)
+    }
+}
+
+/// generate_logo spends the user's credits: 4 per minute.
+@MainActor enum LogoRate {
+    private static var recent: [Date] = []
+    static func allow() -> Bool {
+        let now = Date()
+        recent = recent.filter { now.timeIntervalSince($0) < 60 }
+        guard recent.count < 4 else { return false }
+        recent.append(now)
+        return true
     }
 }

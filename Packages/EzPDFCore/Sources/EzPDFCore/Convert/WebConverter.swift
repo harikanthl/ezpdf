@@ -55,8 +55,8 @@ public enum WebConverter {
         // their own main thread and stop answering. Prepare, snapshot the DOM, picture the
         // embedded frames, then do everything else on a frozen copy with page scripts off.
         progress("Loading images")
-        try? await page.js(prepareJS, timeout: 8)
-        try? await page.js(freezeCanvasJS, timeout: 8)
+        _ = try? await page.js(prepareJS, timeout: 8)
+        _ = try? await page.js(freezeCanvasJS, timeout: 8)
         let frameCount = (try? await page.js(markFramesJS, timeout: 5)) as? Int ?? 0
         let snapshotHTML: String
         do {
@@ -93,7 +93,7 @@ public enum WebConverter {
         let snap = WebSession(width: PagePreset.web.pageSize.width, height: 1400, javaScript: false, allowLocal: allowLocal)
         defer { snap.close() }
         try await snap.loadHTML(snapshotHTML, baseURL: finalURL)
-        try? await snap.js(replaceFramesJS, ["images": Dictionary(uniqueKeysWithValues: frameImages.map { (String($0.key), $0.value) })])
+        _ = try? await snap.js(replaceFramesJS, ["images": Dictionary(uniqueKeysWithValues: frameImages.map { (String($0.key), $0.value) })])
         if frameCount > frameImages.count, frameCount > 0 {
             notes.append("\(frameCount - frameImages.count) embedded chart(s) couldn't be captured.")
         }
@@ -120,7 +120,7 @@ public enum WebConverter {
             progress("Capturing the page")
             let pageTitle = ((try? await snap.jsString("return document.title")) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             title = pageTitle.isEmpty ? (finalURL.host() ?? "Web page") : pageTitle
-            try? await snap.js(hideOverlaysJS)
+            _ = try? await snap.js(hideOverlaysJS)
             await scrollThrough(snap)
             await snap.waitForImages()
             let w = PagePreset.web.pageSize.width
@@ -209,7 +209,7 @@ public enum WebConverter {
         defer { layout.close() }
         try await layout.loadHTML(html, baseURL: baseURL)
         await layout.waitForImages()
-        try? await layout.js(fitWideJS)
+        _ = try? await layout.js(fitWideJS)
         return try await PageLayout.renderPDF(session: layout, pageSize: p.pageSize, margin: p.margin,
                                               contentWidth: p.contentSize.width,
                                               metadata: .init(title: title, author: author, subject: subject))

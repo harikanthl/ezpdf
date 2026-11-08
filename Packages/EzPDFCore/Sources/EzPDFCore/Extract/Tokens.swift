@@ -8,7 +8,10 @@ public enum Money {
         #"^\(?[-−+]?\s?[$€£₹¥]?\s?[-−]?\d+\.\d{2}\)?(?:\s?(?:CR|DR|Cr|Dr|cr|dr|-|−))?$"#,
         // 1.234,56  1 234,56  (European)
         #"^[-−]?\s?[€£]?\s?\d{1,3}(?:[.\s]\d{3})*,\d{2}(?:\s?(?:CR|DR|-|−|€))?$"#,
+        // 4,804,68: OCR read the decimal point as a comma (no real amount is written this way).
+        ocrComma,
     ].map { try! NSRegularExpression(pattern: $0) }
+    private static let ocrComma = #"^\(?[-−+]?\s?[$€£₹¥]?\s?[-−]?\d{1,3}(?:,\d{3})+,\d{2}\)?(?:\s?(?:CR|DR|Cr|Dr|cr|dr|-|−))?$"#
 
     public static func isMoney(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespaces)
@@ -29,8 +32,12 @@ public enum Money {
         if t.hasPrefix("+") { sign = 1 }
         let european = t.range(of: #"\d,\d{2}(\D*)$"#, options: .regularExpression) != nil && !t.contains(".") ||
                        t.range(of: #"\.\d{3},\d{2}"#, options: .regularExpression) != nil
+        let misreadPoint = t.range(of: ocrComma, options: .regularExpression) != nil
         t = t.filter { $0.isNumber || $0 == "." || $0 == "," }
-        if european {
+        if misreadPoint {
+            let digits = t.filter(\.isNumber)
+            t = String(digits.dropLast(2)) + "." + String(digits.suffix(2))
+        } else if european {
             t = t.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
         } else {
             t = t.replacingOccurrences(of: ",", with: "")

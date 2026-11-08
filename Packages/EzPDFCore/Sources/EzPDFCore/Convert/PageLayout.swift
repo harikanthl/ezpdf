@@ -20,7 +20,7 @@ enum PageLayout {
     const sy = window.scrollY || 0;
     const boxes = [];
     const add = (r, k) => { if (r.height > 0.5 && r.width > 0.5) boxes.push([r.top + sy - 1, r.bottom + sy + 1, k]); };
-    document.querySelectorAll('img,svg,video,canvas,picture,math,tr,iframe,hr,.ez-atomic').forEach(e => {
+    document.querySelectorAll('img,svg,video,canvas,picture,math,tr,iframe,hr,.ez-atomic,[data-field]').forEach(e => {
       const tag = e.tagName.toLowerCase();
       if (tag !== 'svg' && e.closest('svg')) return;
       if (tag !== 'math' && e.closest('math')) return;

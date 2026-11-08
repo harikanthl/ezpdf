@@ -40,6 +40,10 @@ struct AppCommands: Commands {
             Divider()
             Button("New from Template…") { app.showTemplates = true }.keyboardShortcut("n", modifiers: [.command, .shift])
         }
+        CommandGroup(replacing: .undoRedo) {
+            Button("Undo") { undoOrRedo(redo: false) }.keyboardShortcut("z")
+            Button("Redo") { undoOrRedo(redo: true) }.keyboardShortcut("z", modifiers: [.command, .shift])
+        }
         CommandMenu("Document") {
             Button("Send to Kindle") { if let d = app.selectedDocument { app.sendToKindle(d) } }
                 .keyboardShortcut("k", modifiers: [.command, .shift]).disabled(app.selectedDocument == nil)
@@ -50,6 +54,16 @@ struct AppCommands: Commands {
                 .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(app.selectedDocument == nil)
             Button("Merge All Visible…") { mergeVisible() }.disabled(app.visibleDocuments.count < 2)
         }
+    }
+
+    /// Typing in a field undoes the typing first; otherwise it's the open document's last change.
+    private func undoOrRedo(redo: Bool) {
+        if let responder = NSApp.keyWindow?.firstResponder as? NSTextView, let manager = responder.undoManager,
+           redo ? manager.canRedo : manager.canUndo {
+            redo ? manager.redo() : manager.undo()
+            return
+        }
+        app.undoDocument(redo: redo)
     }
 
     private func pasteLink() {
@@ -82,7 +96,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = ServiceProvider()
         NSUpdateDynamicServices()
+        AgentApprovalPrompt.install()
+        Fonts.registerSaved()        // fonts fetched for documents earlier, so pages that use them draw right
         LocalServer.shared.start()
+        // The library's full-text index, scanned pages included (in the background; searches never wait on it).
+        Task(priority: .utility) { @MainActor in await EzPDF.shared.refreshSearchIndex() }
         // Current model ids from our catalog worker (at most once a day).
         Task { @MainActor in await ModelCatalogStore.shared.refreshIfNeeded() }
     }

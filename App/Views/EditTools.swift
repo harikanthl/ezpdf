@@ -130,28 +130,37 @@ struct PlacementSheet: View {
     }
 }
 
-/// "Change selected text": the selection, and what it should say instead.
+/// "Change selected text": the selection, and what it should say instead. Errors show here, and
+/// the sheet stays open until the change is made.
 struct ReplaceSheet: View {
     let original: String
-    var onDone: (String) -> Void
+    var onDone: (String) -> String?        // nil when it worked, else what went wrong
     @Environment(\.dismiss) private var dismiss
     @State private var replacement = ""
+    @State private var error: String?
+    @FocusState private var focused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label("Change Text", systemImage: "character.cursor.ibeam").font(.headline)
-            Text(original).font(.callout).foregroundStyle(.secondary).lineLimit(3)
-            TextField("New text", text: $replacement, axis: .vertical).lineLimit(1...4).textFieldStyle(.roundedBorder).frame(width: 360)
-            Text("Keeps the original font, size and color. To remove sensitive text for good, use Redact.")
-                .font(.caption).foregroundStyle(.secondary)
+            Text("“\(original)”").font(.callout).foregroundStyle(.secondary).lineLimit(3)
+            TextField("New text", text: $replacement, axis: .vertical).lineLimit(1...6)
+                .textFieldStyle(.roundedBorder).frame(width: 380).focused($focused)
+            if let error { Label(error, systemImage: "exclamationmark.triangle.fill").font(.callout).foregroundStyle(.orange) }
+            Text("Keeps the original font, size and color, in the same place. Leave it empty to erase. To remove sensitive text for good, use Redact.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).frame(width: 380, alignment: .leading)
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }.buttonStyle(PressableStyle()).keyboardShortcut(.cancelAction)
-                Button("Change") { onDone(replacement); dismiss() }.buttonStyle(PressableStyle(prominent: true)).keyboardShortcut(.defaultAction)
+                Button("Change") {
+                    if let e = onDone(replacement) { withAnimation(Motion.outFast) { error = e } } else { dismiss() }
+                }
+                .buttonStyle(PressableStyle(prominent: true)).keyboardShortcut(.defaultAction)
+                .disabled(replacement == original)
             }
         }
         .padding(18)
-        .onAppear { replacement = original }
+        .onAppear { replacement = original; focused = true }
     }
 }
 
@@ -210,7 +219,12 @@ struct ObjectEditSheet: View {
 /// Mark & Talk: draw on the page (circle a word, underline a line, scribble over a box) while you
 /// say what to change. Strokes stay until the message is sent.
 struct MarkOverlay: View {
-    @Binding var strokes: [[CGPoint]]
+    @Binding var strokes: [ReaderController.PenStroke]
+    /// Pins a finished stroke (view coordinates) to its page, and maps a pinned one back to the view.
+    var anchor: ([CGPoint]) -> ReaderController.PenStroke?
+    var toView: (ReaderController.PenStroke) -> [CGPoint]
+    /// Changes on scroll and zoom, so the pinned strokes redraw where their page is now.
+    var viewport: Int
     var onStrokeEnded: () -> Void
     var onDone: () -> Void
     @State private var current: [CGPoint] = []
@@ -218,7 +232,8 @@ struct MarkOverlay: View {
     var body: some View {
         ZStack(alignment: .top) {
             Canvas { ctx, _ in
-                for s in strokes + [current] where s.count > 1 {
+                _ = viewport
+                for s in strokes.map(toView) + [current] where s.count > 1 {
                     var p = Path()
                     p.addLines(s)
                     ctx.stroke(p, with: .color(.red.opacity(0.85)), style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
@@ -228,7 +243,7 @@ struct MarkOverlay: View {
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in current.append(v.location) }
                 .onEnded { _ in
-                    if current.count > 1 { strokes.append(current) }
+                    if let s = anchor(current) { strokes.append(s) }
                     current = []
                     onStrokeEnded()
                 })

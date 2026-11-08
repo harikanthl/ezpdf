@@ -176,6 +176,21 @@ final class AppModel {
         } catch { show(error.localizedDescription, error: true) }
     }
 
+    /// Saves what the open reader still holds (highlights, a nudge) before the document changes underneath it.
+    @ObservationIgnored var flushPendingEdits: () -> Void = {}
+
+    /// Undo or redo the open document's last change (⌘Z, ⇧⌘Z).
+    func undoDocument(redo: Bool) {
+        guard let id = selection else { NSSound.beep(); return }
+        flushPendingEdits()
+        do {
+            let rec = redo ? try ops.redo(id) : try ops.undo(id)
+            show(redo ? "Redone" : "Undone", documentID: rec.id)
+        } catch {
+            show(error.localizedDescription, error: true)
+        }
+    }
+
     func show(_ message: String, error: Bool = false, documentID: String? = nil) {
         toast = Toast(message: message, isError: error, documentID: documentID)
         toastTask?.cancel()

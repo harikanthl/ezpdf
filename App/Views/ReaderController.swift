@@ -30,6 +30,10 @@ final class ReaderController: NSObject, ObservableObject {
     let pdfView = EditablePDFView()
     /// Asks the view to edit an object (double-click / Return): the object id and its current state.
     var onEditObject: ((String, PDFAnnotation) -> Void)?
+    /// A change to a placed object couldn't be saved: the message to show (the view is reloaded).
+    var onError: ((String) -> Void)?
+    /// A picture pasted onto the page (placed like a dropped image).
+    var onPasteImage: ((Data) -> Void)?
     private(set) var documentID: String?
 
     @Published var pageCount = 0
@@ -44,6 +48,9 @@ final class ReaderController: NSObject, ObservableObject {
     @Published var twoUp = false
     @Published var hasSelection = false
     @Published var unsavedAnnotations = false
+    /// Changes whenever the visible area scrolls or zooms (overlays pinned to pages redraw on it).
+    @Published private(set) var viewport = 0
+    nonisolated(unsafe) private var scrollObserver: NSObjectProtocol?
     /// When this reader last saved the document; its own saves don't trigger a reload.
     private(set) var lastSavedModifiedAt: Date?
     /// The file version currently shown.
@@ -71,6 +78,9 @@ final class ReaderController: NSObject, ObservableObject {
         synthesizer.delegate = self
         pdfView.onCommit = { [weak self] a, page in self?.commitObject(a, on: page) }
         pdfView.onDelete = { [weak self] a, page in self?.deleteObject(a, on: page) }
+        pdfView.onCopyObject = { [weak self] a, page in self?.copyObject(a, on: page) }
+        pdfView.onPaste = { [weak self] in self?.paste() }
+        pdfView.canPaste = { ObjectClipboard.hasContent(NSPasteboard.general) }
         pdfView.onEdit = { [weak self] a, _ in
             guard let id = Objects.objectID(a) else { return }
             self?.onEditObject?(id, a)
@@ -80,7 +90,7 @@ final class ReaderController: NSObject, ObservableObject {
             MainActor.assumeIsolated { self?.syncPage() }
         })
         observers.append(center.addObserver(forName: .PDFViewScaleChanged, object: pdfView, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.syncZoom() }
+            MainActor.assumeIsolated { self?.syncZoom(); self?.viewport &+= 1 }
         })
         observers.append(center.addObserver(forName: .PDFViewSelectionChanged, object: pdfView, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.hasSelection = !(self?.pdfView.currentSelection?.string ?? "").isEmpty }
@@ -89,6 +99,18 @@ final class ReaderController: NSObject, ObservableObject {
 
     deinit {
         for o in observers { NotificationCenter.default.removeObserver(o) }
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+    }
+
+    /// Follows scrolling of the PDF view's clip view (it's created with the document).
+    private func watchScrolling() {
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+        scrollObserver = nil
+        guard let clip = pdfView.documentView?.enclosingScrollView?.contentView else { return }
+        clip.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.viewport &+= 1 }
+        }
     }
 
     func load(_ rec: DocumentRecord, url: URL, page: Int? = nil) {
@@ -118,44 +140,67 @@ final class ReaderController: NSObject, ObservableObject {
             }
             self.restoring = false
             self.syncPage()
+            self.watchScrolling()
         }
         if sameDocument, !matches.isEmpty { clearSearch() }   // old selections belong to the old document
         syncZoom()
     }
 
     /// A rectangle drawn over the PDF view (SwiftUI coordinates, origin top-left) → the page it's on
-    /// and the rectangle in that page's points, origin top-left of the crop box.
+    /// and the rectangle in that page's points, origin top-left of the page as shown.
     func pageRect(fromView r: CGRect) -> (page: Int, rect: CGRect)? {
         let h = pdfView.bounds.height
         let nsRect = CGRect(x: r.minX, y: h - r.maxY, width: r.width, height: r.height)
         guard let doc = pdfView.document,
               let page = pdfView.page(for: CGPoint(x: nsRect.midX, y: nsRect.midY), nearest: true) else { return nil }
         let p = pdfView.convert(nsRect, to: page)
-        let crop = page.bounds(for: .cropBox)
-        let topLeft = CGRect(x: p.minX - crop.minX, y: crop.maxY - p.maxY, width: p.width, height: p.height)
-        return (doc.index(for: page) + 1, topLeft)
+        return (doc.index(for: page) + 1, EditOps.PageSpace(page).topLeft(p))
     }
 
-    /// Pen strokes (SwiftUI view coordinates) → the page they're on, their box in page points
-    /// (top-left), the words under them, and a picture of the area with the marks drawn on it.
-    func mark(from strokes: [[CGPoint]]) -> AssistantModel.Mark? {
-        let pts = strokes.flatMap { $0 }
-        guard !pts.isEmpty, let doc = pdfView.document else { return nil }
+    /// A pen stroke pinned to the page it was drawn on, in page points, so it stays on the same
+    /// words when the view scrolls or zooms.
+    struct PenStroke: Equatable {
+        var page: Int          // 0-based
+        var points: [CGPoint]
+    }
+
+    /// A stroke drawn over the view (SwiftUI coordinates, origin top-left) → pinned to its page.
+    func anchor(_ viewPoints: [CGPoint]) -> PenStroke? {
+        guard viewPoints.count > 1, let doc = pdfView.document else { return nil }
         let h = pdfView.bounds.height
-        let ns = pts.map { CGPoint(x: $0.x, y: h - $0.y) }
+        let ns = viewPoints.map { CGPoint(x: $0.x, y: h - $0.y) }
         let cx = ns.map(\.x).reduce(0, +) / CGFloat(ns.count), cy = ns.map(\.y).reduce(0, +) / CGFloat(ns.count)
         guard let page = pdfView.page(for: CGPoint(x: cx, y: cy), nearest: true) else { return nil }
-        let pagePts = ns.map { pdfView.convert($0, to: page) }
+        return PenStroke(page: doc.index(for: page), points: ns.map { pdfView.convert($0, to: page) })
+    }
+
+    /// Where a pinned stroke is on screen now (SwiftUI coordinates).
+    func viewPoints(_ s: PenStroke) -> [CGPoint] {
+        guard let page = pdfView.document?.page(at: s.page) else { return [] }
+        let h = pdfView.bounds.height
+        return s.points.map { let v = pdfView.convert($0, from: page); return CGPoint(x: v.x, y: h - v.y) }
+    }
+
+    /// Pen strokes → the page they're on (the latest stroke's page), their box in page points
+    /// (top-left, as shown), the words under them, and a picture of the area with the marks on it.
+    func mark(from all: [PenStroke]) -> AssistantModel.Mark? {
+        guard let last = all.last, let doc = pdfView.document, let page = doc.page(at: last.page) else { return nil }
+        let strokes = all.filter { $0.page == last.page }.map(\.points)
+        let pagePts = strokes.flatMap { $0 }
         guard let minX = pagePts.map(\.x).min(), let maxX = pagePts.map(\.x).max(),
               let minY = pagePts.map(\.y).min(), let maxY = pagePts.map(\.y).max() else { return nil }
         let crop = page.bounds(for: .cropBox)
         let box = CGRect(x: minX, y: minY, width: max(4, maxX - minX), height: max(4, maxY - minY)).insetBy(dx: -6, dy: -6).intersection(crop)
+        // Drawn beside the page (in the gutter): nothing is marked.
+        guard !box.isNull, box.width >= 1, box.height >= 1, box.minX.isFinite, box.minY.isFinite else { return nil }
         let text = (page.selection(for: box)?.string ?? "")
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression).trimmingCharacters(in: .whitespaces)
-        let topLeft = CGRect(x: box.minX - crop.minX, y: crop.maxY - box.maxY, width: box.width, height: box.height)
-        // Picture: the area plus some context, with the strokes in red.
-        let area = box.insetBy(dx: -40, dy: -30).intersection(crop)
-        let scale: CGFloat = 2
+        let space = EditOps.PageSpace(page)
+        let topLeft = space.topLeft(box)
+        // Picture: the area as shown plus some context, with the strokes in red.
+        let area = space.shownRect(topLeft).insetBy(dx: -40, dy: -30).intersection(CGRect(origin: .zero, size: space.size))
+        // Sharp enough for a model to read, capped so a big scribble on a poster page stays small.
+        let scale: CGFloat = min(2, 1568 / max(1, max(area.width, area.height)))
         var png: Data?
         if area.width > 2, area.height > 2, let ctx = CGContext(data: nil, width: Int(area.width * scale), height: Int(area.height * scale), bitsPerComponent: 8, bytesPerRow: 0,
                                      space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
@@ -163,30 +208,25 @@ final class ReaderController: NSObject, ObservableObject {
             ctx.fill(CGRect(x: 0, y: 0, width: area.width * scale, height: area.height * scale))
             ctx.scaleBy(x: scale, y: scale)
             ctx.translateBy(x: -area.minX, y: -area.minY)
-            page.draw(with: .cropBox, to: ctx)
+            page.draw(with: .cropBox, to: ctx)          // draws the page as shown (crop and rotation applied)
+            ctx.concatenate(space.toShown)              // strokes are in page space
             ctx.setStrokeColor(NSColor.systemRed.cgColor)
             ctx.setLineWidth(2.5); ctx.setLineCap(.round); ctx.setLineJoin(.round)
-            var i = 0
-            for s in strokes {
-                let ps = s.map { pdfView.convert(CGPoint(x: $0.x, y: h - $0.y), to: page) }
-                i += s.count
-                guard ps.count > 1 else { continue }
+            for ps in strokes where ps.count > 1 {
                 ctx.addLines(between: ps)
                 ctx.strokePath()
             }
             if let img = ctx.makeImage() {
-                let rep = NSBitmapImageRep(cgImage: img)
-                png = rep.representation(using: .png, properties: [:])
+                png = NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])
             }
         }
-        return AssistantModel.Mark(page: doc.index(for: page) + 1, rect: topLeft, text: String(text.prefix(1000)), image: png)
+        return AssistantModel.Mark(page: doc.index(for: page) + 1, rect: topLeft, text: String(text.prefix(1000)), image: png, docID: documentID ?? "")
     }
 
-    /// The selected text and its page (1-based), for "change selected text".
-    var selectionForEdit: (text: String, page: Int)? {
-        guard let sel = pdfView.currentSelection, let text = sel.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !text.isEmpty, let page = sel.pages.first, let doc = pdfView.document else { return nil }
-        return (text, doc.index(for: page) + 1)
+    /// The selection, with its line boxes and style, for "change selected text".
+    var selectionForEdit: EditOps.SelectionInfo? {
+        guard let sel = pdfView.currentSelection, let doc = pdfView.document else { return nil }
+        return EditOps.selectionInfo(sel, in: doc)
     }
 
     // MARK: Navigation
@@ -300,8 +340,9 @@ final class ReaderController: NSObject, ObservableObject {
 
     func addNote(_ text: String) {
         guard let page = pdfView.currentPage, !text.isEmpty else { return }
-        let b = page.bounds(for: .cropBox)
-        let a = PDFAnnotation(bounds: CGRect(x: b.maxX - 44, y: b.maxY - 44, width: 20, height: 20), forType: .text, withProperties: nil)
+        // Top right of the page as shown.
+        let space = EditOps.PageSpace(page)
+        let a = PDFAnnotation(bounds: space.pageRect(CGRect(x: space.size.width - 44, y: 24, width: 20, height: 20)), forType: .text, withProperties: nil)
         a.contents = text
         a.color = .systemYellow
         page.addAnnotation(a)
@@ -318,16 +359,26 @@ final class ReaderController: NSObject, ObservableObject {
     /// Saves pending highlights and notes by adding them to the current file (with an undo point).
     /// Call before any other edit so the order of changes is kept.
     func flushAnnotations() {
+        pdfView.flushNudge()
         saveTask?.cancel()
         guard let id = documentID, !pending.isEmpty else { unsavedAnnotations = false; return }
         let items = pending
         pending = []
         unsavedAnnotations = false
+        let onDiskBefore = Library.shared.record(id)?.modifiedAt
         do {
             let rec = try EzPDF.shared.addAnnotations(id, items)
             lastSavedModifiedAt = rec.modifiedAt
-            // If nothing else changed the file, what's on screen is what's saved.
-            if loadedModifiedAt != nil { loadedModifiedAt = rec.modifiedAt }
+            if onDiskBefore == loadedModifiedAt {
+                // Nothing else changed the file: what's on screen is what's saved.
+                loadedModifiedAt = rec.modifiedAt
+            } else {
+                // Someone else saved first (an agent, the assistant): show their change too.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let latest = Library.shared.record(id), self.documentID == id else { return }
+                    self.load(latest, url: Library.shared.pdfURL(for: id), page: self.currentPageIndex + 1)
+                }
+            }
         } catch {
             pending = items + pending      // keep them; try again on the next save
             unsavedAnnotations = true
@@ -340,18 +391,89 @@ final class ReaderController: NSObject, ObservableObject {
     private func commitObject(_ a: PDFAnnotation, on page: PDFPage) {
         guard let docID = documentID, let objectID = Objects.objectID(a), let doc = pdfView.document else { return }
         flushAnnotations()
-        let crop = page.bounds(for: .cropBox)
-        let r = CGRect(x: a.bounds.minX - crop.minX, y: crop.maxY - a.bounds.maxY, width: a.bounds.width, height: a.bounds.height)
-        if let rec = try? EzPDF.shared.updateObject(docID, object: objectID, .init(page: doc.index(for: page) + 1, rect: r)) {
+        let pageNumber = doc.index(for: page) + 1
+        do {
+            let rec = try EzPDF.shared.updateObject(docID, object: objectID, onPage: pageNumber,
+                                                    .init(page: pageNumber, rect: EditOps.PageSpace(page).topLeft(a.bounds)))
             lastSavedModifiedAt = rec.modifiedAt
+            loadedModifiedAt = rec.modifiedAt
+        } catch {
+            failed("Couldn't save that move: \(error.localizedDescription)")
         }
     }
 
     private func deleteObject(_ a: PDFAnnotation, on page: PDFPage) {
-        guard let docID = documentID, let objectID = Objects.objectID(a) else { return }
+        guard let docID = documentID, let objectID = Objects.objectID(a), let doc = pdfView.document else { return }
         flushAnnotations()
+        let pageNumber = doc.index(for: page) + 1
         page.removeAnnotation(a)
-        if let rec = try? EzPDF.shared.deleteObject(docID, object: objectID) { lastSavedModifiedAt = rec.modifiedAt }
+        do {
+            let rec = try EzPDF.shared.deleteObject(docID, object: objectID, onPage: pageNumber)
+            lastSavedModifiedAt = rec.modifiedAt
+            loadedModifiedAt = rec.modifiedAt
+        } catch {
+            failed("Couldn't delete it: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: Copy and paste
+
+    private func copyObject(_ a: PDFAnnotation, on page: PDFPage) {
+        guard let docID = documentID, let objectID = Objects.objectID(a), let doc = pdfView.document else { return }
+        let image = a is ImageStampAnnotation || (a.contents ?? "").hasPrefix("ezpdf-image:")
+            ? try? Data(contentsOf: Library.shared.folder(for: docID).appendingPathComponent("objects/\(objectID).png")) : nil
+        let clip = ObjectClipboard.Clip(
+            documentID: docID, page: doc.index(for: page), rect: EditOps.PageSpace(page).topLeft(a.bounds),
+            text: image == nil && a.type == "FreeText" ? a.contents : nil,
+            fontName: a.font?.fontName, fontSize: a.font.map { Double($0.pointSize) },
+            color: (a.type == "FreeText" ? a.fontColor : a.color).map { Objects.hexColor($0) }, image: image,
+            shape: a.type == "Square" ? "rectangle" : a.type == "Circle" ? "ellipse" : a.type == "Line" ? "line" : nil)
+        ObjectClipboard.write(clip, to: NSPasteboard.general)
+    }
+
+    /// Pastes onto the page in view: a copied object (a little offset if it's the same page it came
+    /// from), a picture as an image object, or text as a text box.
+    private func paste() {
+        guard let docID = documentID, let doc = pdfView.document, let page = pdfView.currentPage else { return }
+        flushAnnotations()
+        let pageIndex = doc.index(for: page)
+        let shown = EditOps.PageSpace(page).bounds
+        let pb = NSPasteboard.general
+        do {
+            if let clip = ObjectClipboard.read(pb) {
+                var r = clip.rect
+                if clip.documentID == docID && clip.page == pageIndex { r = r.offsetBy(dx: 14, dy: 14) }
+                r.origin.x = min(max(0, r.minX), max(0, shown.width - r.width))
+                r.origin.y = min(max(0, r.minY), max(0, shown.height - r.height))
+                let color = clip.color.flatMap { ColorName.parse($0) }
+                let rec: DocumentRecord
+                if let image = clip.image {
+                    rec = try EzPDF.shared.addContent(docID, .init(kind: .image, page: pageIndex + 1, rect: r, imageData: image))
+                } else if let text = clip.text {
+                    rec = try EzPDF.shared.addContent(docID, .init(kind: .text, page: pageIndex + 1, rect: r, text: text, fontName: clip.fontName,
+                                                                   fontSize: clip.fontSize.map { CGFloat($0) }, color: color))
+                } else if let shape = clip.shape.flatMap(EditOps.Shape.init(rawValue:)) {
+                    rec = try EzPDF.shared.addContent(docID, .init(kind: .shape, page: pageIndex + 1, rect: r, color: color, shape: shape))
+                } else { return }
+                _ = rec
+            } else if let image = ObjectClipboard.image(pb) {
+                onPasteImage?(image)
+            } else if let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty {
+                let r = CGRect(x: 48, y: 60, width: min(360, shown.width - 96), height: 20)
+                _ = try EzPDF.shared.addContent(docID, .init(kind: .text, page: pageIndex + 1, rect: r, text: String(text.prefix(4000))))
+            }
+        } catch {
+            onError?("Couldn't paste: \(error.localizedDescription)")
+        }
+    }
+
+    /// Shows the error and puts the saved state back on screen, so the view never shows a change
+    /// the file doesn't have.
+    private func failed(_ message: String) {
+        onError?(message)
+        guard let id = documentID, let rec = Library.shared.record(id) else { return }
+        let page = currentPageIndex + 1
+        load(rec, url: Library.shared.pdfURL(for: id), page: page)
     }
 
     // MARK: Read aloud

@@ -83,9 +83,27 @@ enum AIExtractor {
         return try await s.respond(to: notes.joined(separator: "\n")).content
     }
 
-    static func invoice(text: String) async throws -> InvoiceResult {
+    @Generable
+    struct AIMarkIntent {
+        @Guide(description: "replace: the request changes what the marked words say. delete: the request removes them. other: anything else, such as signing, adding something next to them, formatting, or questions.")
+        var action: String
+        @Guide(description: "For replace: the complete new text that should stand where the marked words are, in the same form as the marked words (keep labels like 'Due Date:' if they were marked). Empty otherwise.")
+        var replacement: String
+    }
+
+    /// What a pen mark plus a short spoken request means, as a structured answer the small model
+    /// fills reliably: replace or delete the marked words, or "other" for the full assistant.
+    static func markIntent(marked: String, request: String) async throws -> (action: String, replacement: String) {
+        let session = LanguageModelSession(instructions: "You turn a request about some marked words into an edit. Answer only with the fields asked for.")
+        let r = try await session.respond(to: "Marked words: \"\(marked.prefix(400))\"\nRequest: \"\(request.prefix(400))\"", generating: AIMarkIntent.self).content
+        return (r.action.lowercased().trimmingCharacters(in: .whitespaces), r.replacement)
+    }
+
+    /// `problems`: what was wrong with an earlier reading, to read the text again with.
+    static func invoice(text: String, problems: [String] = []) async throws -> InvoiceResult {
         let session = LanguageModelSession(instructions: "You read invoices and receipts and copy their fields exactly. Never invent values; use empty strings or 0 when a field is missing.")
-        let r = try await session.respond(to: "Invoice text:\n\n\(text.prefix(9000))", generating: AIInvoice.self).content
+        let again = problems.isEmpty ? "" : "\n\nAn earlier reading had these problems. Read the text again carefully and correct any misread values; never change a number just to make it add up:\n- " + problems.joined(separator: "\n- ")
+        let r = try await session.respond(to: "Invoice text:\n\n\(text.prefix(9000))" + again, generating: AIInvoice.self).content
         func s(_ v: String) -> String? { v.trimmingCharacters(in: .whitespaces).isEmpty ? nil : v }
         func d(_ v: Double) -> Double? { v == 0 ? nil : v }
         return InvoiceResult(vendor: s(r.vendor), vendorAddress: nil, billTo: s(r.billTo), invoiceNumber: s(r.invoiceNumber),
@@ -95,11 +113,12 @@ enum AIExtractor {
                              method: "apple-intelligence", warnings: [])
     }
 
-    static func transactions(pages: [(page: Int, text: String)]) async throws -> [Transaction] {
+    static func transactions(pages: [(page: Int, text: String)], problems: [String] = []) async throws -> [Transaction] {
         var out: [Transaction] = []
+        let again = problems.isEmpty ? "" : "\n\nAn earlier reading had these problems. Read the rows again carefully (signs, amounts, balances); never change a number just to make it add up:\n- " + problems.joined(separator: "\n- ")
         for p in pages where !p.text.isEmpty {
             let session = LanguageModelSession(instructions: "You copy bank statement transactions exactly as printed. Never invent rows.")
-            let r = try await session.respond(to: "Statement page \(p.page):\n\n\(p.text.prefix(7000))", generating: AITransactions.self).content
+            let r = try await session.respond(to: "Statement page \(p.page):\n\n\(p.text.prefix(7000))" + again, generating: AITransactions.self).content
             out += r.transactions.map {
                 Transaction(date: $0.date, description: $0.description, amount: $0.amount,
                             balance: $0.balance == 0 ? nil : $0.balance, page: p.page, reconciled: false)

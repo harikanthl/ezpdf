@@ -18,14 +18,14 @@ extension EzPDF {
     public func pageLayout(_ id: String, page: Int) async throws -> PageLayout {
         let (_, doc) = try document(id)
         guard let p = doc.page(at: page - 1) else { throw EzPDFError.invalidInput("No page \(page).") }
-        let crop = p.bounds(for: .cropBox)
+        let size = EditOps.PageSpace(p).size
         var frags = PageText.words(page: p, index: page - 1)
         if frags.count < 5 { frags = await PageText.ocrFragments(page: p, index: page - 1) }
         let lines = PageText.group(frags).prefix(400).map { l -> PageLayout.Line in
             let r = l.cells.map(\.rect).reduce(CGRect.null) { $0.union($1) }
             return .init(text: l.text, rect: [r.minX, r.minY, r.width, r.height].map { (Double($0) * 10).rounded() / 10 })
         }
-        return PageLayout(page: page, width: Double(crop.width), height: Double(crop.height), lines: Array(lines))
+        return PageLayout(page: page, width: Double(size.width), height: Double(size.height), lines: Array(lines))
     }
 
     @discardableResult
@@ -35,6 +35,17 @@ extension EzPDF {
         let set = try pages.map { Set(try PageOps.pages($0, count: doc.pageCount)) }
         let changes = try EditOps.replaceText(doc, find: find, with: replacement, pages: set, matchCase: matchCase, wholeWord: wholeWord)
         return (try commitEdit(rec.id, doc), changes)
+    }
+
+    /// Replaces a selection made in the reader (see EditOps.replaceRegion). Returns the edit checks' notes.
+    @discardableResult
+    public func replaceSelection(_ id: String, _ info: EditOps.SelectionInfo, with text: String) throws -> (record: DocumentRecord, notes: [String]) {
+        let (rec, doc) = try document(id, strict: true)
+        guard info.page >= 0, info.page < doc.pageCount else { throw EzPDFError.invalidInput("That page is gone; select the text again.") }
+        let notes = try EditOps.replaceRegion(doc, page: info.page, lines: info.lines, text: text,
+                                              font: EditOps.font(named: info.fontName, size: info.fontSize),
+                                              color: ColorName.parse(info.colorHex) ?? .black)
+        return (try commitEdit(rec.id, doc), notes)
     }
 
     public enum ContentKind: String, Codable, Sendable, CaseIterable { case text, image, signature, shape, whiteout }
@@ -62,11 +73,12 @@ extension EzPDF {
         let (rec, doc) = try document(id, strict: true)
         let index = req.page - 1
         guard let page = doc.page(at: index) else { throw EzPDFError.invalidInput("No page \(req.page); the document has \(doc.pageCount).") }
-        let crop = page.bounds(for: .cropBox)
+        let space = EditOps.PageSpace(page)
+        let size = space.size
         let r = req.rect
-        guard r.width > 0, r.height > 0, r.width.isFinite, r.height.isFinite, r.minX > -crop.width, r.minY > -crop.height,
-              r.minX < crop.width, r.minY < crop.height else {
-            throw EzPDFError.invalidInput("That box is off the page (page is \(Int(crop.width)) × \(Int(crop.height)) points, origin top-left).")
+        guard r.width > 0, r.height > 0, r.width.isFinite, r.height.isFinite, r.minX > -size.width, r.minY > -size.height,
+              r.minX < size.width, r.minY < size.height else {
+            throw EzPDFError.invalidInput("That box is off the page (page is \(Int(size.width)) × \(Int(size.height)) points, origin top-left).")
         }
         let folder = library.folder(for: rec.id)
         switch req.kind {
@@ -90,9 +102,9 @@ extension EzPDF {
             }
         case .shape:
             try EditOps.addShape(doc, page: index, shape: req.shape ?? .rectangle, rect: r, color: req.color ?? .systemRed)
-            if let a = doc.page(at: index)?.annotations.last { a.userName = Objects.marker + UUID().uuidString.lowercased() }
+            if let a = doc.page(at: index)?.annotations.last { a.userName = Objects.marker + Objects.newID() }
         case .whiteout:
-            let bg = EditOps.backgroundColor(page, around: EditOps.pdfRect(r, crop: crop)) ?? .white
+            let bg = EditOps.backgroundColor(page, around: space.pageRect(r)) ?? .white
             try EditOps.compose(doc, page: index, overlays: [.fill(r, req.color ?? bg)])
         }
         return try commitEdit(rec.id, doc)
@@ -169,18 +181,25 @@ extension EzPDF {
 
     /// Moves, resizes or edits a placed object (text box, signature, image, box).
     @discardableResult
-    public func updateObject(_ id: String, object: String, _ change: ObjectChange) throws -> DocumentRecord {
+    /// `onPage` (1-based) is where the caller saw the object, preferred when looking it up.
+    public func updateObject(_ id: String, object: String, onPage: Int? = nil, _ change: ObjectChange) throws -> DocumentRecord {
         let (rec, doc) = try document(id, strict: true)
-        Objects.hydrate(doc, folder: library.folder(for: rec.id))
-        guard let (pageIndex, a) = Objects.find(doc, id: object) else { throw EzPDFError.invalidInput("No object \(object) in “\(rec.title)”.") }
+        guard let (pageIndex, a) = Objects.find(doc, id: object, preferring: onPage.map { $0 - 1 }) else {
+            throw EzPDFError.invalidInput("No object \(object) in “\(rec.title)”.")
+        }
         var page = doc.page(at: pageIndex)!
         if let target = change.page, target - 1 != pageIndex {
             guard let dest = doc.page(at: target - 1) else { throw EzPDFError.invalidInput("No page \(target).") }
+            // Same spot as shown on the new page (pages can differ in size, crop and rotation).
+            let shown = EditOps.PageSpace(page).topLeft(a.bounds)
             page.removeAnnotation(a); dest.addAnnotation(a); page = dest
+            a.bounds = EditOps.PageSpace(dest).pageRect(shown)
         }
         if let r = change.rect {
-            guard r.width > 2, r.height > 2, r.width.isFinite, r.height.isFinite else { throw EzPDFError.invalidInput("That box is too small.") }
-            a.bounds = EditOps.pdfRect(r, crop: page.bounds(for: .cropBox))
+            guard r.width > 2, r.height > 2, r.width.isFinite, r.height.isFinite, r.minX.isFinite, r.minY.isFinite else {
+                throw EzPDFError.invalidInput("That box is too small.")
+            }
+            a.bounds = EditOps.PageSpace(page).pageRect(r)
         }
         if a.type == "FreeText" {
             if let t = change.text { a.contents = t }
@@ -190,23 +209,27 @@ extension EzPDF {
                 a.font = change.fontName.map { EditOps.font(named: $0, size: size) } ?? current.withSize(size)
             }
             if let c = change.color { a.fontColor = c }
+            if change.text != nil || change.fontName != nil || change.fontSize != nil { Objects.refit(a, on: page) }
         } else if let c = change.color {
             a.color = c
         }
+        Objects.clampToPage(a, on: page)
         return try commitEdit(rec.id, doc)
     }
 
     @discardableResult
-    public func deleteObject(_ id: String, object: String) throws -> DocumentRecord {
+    public func deleteObject(_ id: String, object: String, onPage: Int? = nil) throws -> DocumentRecord {
         let (rec, doc) = try document(id, strict: true)
-        guard let (pageIndex, a) = Objects.find(doc, id: object) else { throw EzPDFError.invalidInput("No object \(object).") }
+        guard let (pageIndex, a) = Objects.find(doc, id: object, preferring: onPage.map { $0 - 1 }) else {
+            throw EzPDFError.invalidInput("No object \(object).")
+        }
         doc.page(at: pageIndex)?.removeAnnotation(a)
-        try? FileManager.default.removeItem(at: library.folder(for: rec.id).appendingPathComponent("objects/\(object).png"))
+        // The image file stays while the undo copy uses it; commit clears files nothing uses.
         return try commitEdit(rec.id, doc)
     }
 
-    /// The bytes to hand outside ezpdf: placed objects and annotations burned into the pages when
-    /// there are any, else the file as it is.
+    /// The bytes to hand outside ezpdf: placed objects drawn into the pages when there are any
+    /// (links, bookmarks, forms and markup kept), else the file as it is.
     public func deliverableData(_ id: String) throws -> Data {
         let rec = try record(id)
         let url = library.pdfURL(for: rec.id)
@@ -243,24 +266,31 @@ extension EzPDF {
     /// rebuilt from pixels, so nothing under the boxes survives; their text is made searchable again.
     @discardableResult
     public func redact(_ id: String, text: String? = nil, boxes: [(page: Int, rect: CGRect)] = [], pages: String? = nil) async throws -> (record: DocumentRecord, count: Int, pages: [Int]) {
-        let (rec, doc) = try document(id, strict: true)
-        let set = try pages.map { Set(try PageOps.pages($0, count: doc.pageCount)) }
-        var byPage: [Int: [CGRect]] = [:]
-        if let text, !text.isEmpty {
-            for (p, rects) in EditOps.rects(of: text, in: doc, pages: set) { byPage[p, default: []] += rects }
+        // OCR takes a while; if something else saves the document meanwhile, redo the redaction on
+        // the newer file rather than writing over that change.
+        for _ in 0..<3 {
+            let (rec, doc) = try document(id, strict: true)
+            let revision = rec.modifiedAt
+            let set = try pages.map { Set(try PageOps.pages($0, count: doc.pageCount)) }
+            var byPage: [Int: [CGRect]] = [:]
+            if let text, !text.isEmpty {
+                for (p, rects) in EditOps.rects(of: text, in: doc, pages: set) { byPage[p, default: []] += rects }
+            }
+            for b in boxes where b.page >= 1 && b.page <= doc.pageCount { byPage[b.page - 1, default: []].append(b.rect) }
+            let total = byPage.values.reduce(0) { $0 + $1.count }
+            guard total > 0 else { throw EzPDFError.invalidInput(text.map { "“\($0)” doesn't appear in “\(rec.title)”." } ?? "Nothing to redact.") }
+            for (p, rects) in byPage { try EditOps.redact(doc, page: p, rects: rects) }
+            // Make the rebuilt pages searchable again, off the main thread on a private copy.
+            guard let raw = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the redaction.") }
+            let ocr = await Task.detached(priority: .userInitiated) { () -> Data? in
+                guard let own = PDFDocument(data: raw) else { return nil }
+                return PageOps.makeSearchable(own)
+            }.value
+            guard try record(rec.id, strict: true).modifiedAt == revision else { continue }
+            let saved = try commitEditData(rec.id, ocr ?? raw)
+            return (saved, total, byPage.keys.sorted().map { $0 + 1 })
         }
-        for b in boxes where b.page >= 1 && b.page <= doc.pageCount { byPage[b.page - 1, default: []].append(b.rect) }
-        let total = byPage.values.reduce(0) { $0 + $1.count }
-        guard total > 0 else { throw EzPDFError.invalidInput(text.map { "“\($0)” doesn't appear in “\(rec.title)”." } ?? "Nothing to redact.") }
-        for (p, rects) in byPage { try EditOps.redact(doc, page: p, rects: rects) }
-        // Make the rebuilt pages searchable again, off the main thread on a private copy.
-        guard let raw = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the redaction.") }
-        let ocr = await Task.detached(priority: .userInitiated) { () -> Data? in
-            guard let own = PDFDocument(data: raw) else { return nil }
-            return PageOps.makeSearchable(own)
-        }.value
-        let saved = try commitEditData(rec.id, ocr ?? raw)
-        return (saved, total, byPage.keys.sorted().map { $0 + 1 })
+        throw EzPDFError.failed("The document kept changing while redacting; nothing was redacted. Try again.")
     }
 
     public func listAnnotations(_ id: String) throws -> [EditOps.AnnotationInfo] {
@@ -280,7 +310,9 @@ extension EzPDF {
     @discardableResult
     public func flatten(_ id: String) throws -> DocumentRecord {
         let (rec, doc) = try document(id, strict: true)
-        guard let data = EditOps.flatten(doc) else { throw EzPDFError.failed("Couldn't flatten.") }
+        // Placed objects first (an image is only a placeholder until it's drawn in), then the rest.
+        let source = Objects.hasObjects(doc) ? PDFDocument(data: try Objects.deliverable(doc, folder: library.folder(for: rec.id))) : doc
+        guard let source, let data = EditOps.flatten(source) else { throw EzPDFError.failed("Couldn't flatten.") }
         return try commitEditData(rec.id, data)
     }
 
@@ -294,9 +326,9 @@ extension EzPDF {
     }
 
     // Edits go through the same validated, undoable commit as page operations.
-    func commitEdit(_ id: String, _ doc: PDFDocument) throws -> DocumentRecord {
+    func commitEdit(_ id: String, _ doc: PDFDocument, caller: String = #function) throws -> DocumentRecord {
         guard let data = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the change.") }
-        return try commitEditData(id, data)
+        return try commitEditData(id, data, caller: caller)
     }
 }
 
@@ -311,5 +343,24 @@ public enum ColorName {
         if t.hasPrefix("#") { t.removeFirst() }
         guard t.count == 6, let v = UInt32(t, radix: 16) else { return nil }
         return NSColor(srgbRed: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
+    }
+}
+
+// MARK: Fonts
+
+extension EzPDF {
+    /// Whether ezpdf may fetch open-licensed fonts a document uses (Settings › General).
+    public static let fetchFontsKey = "ezpdf.fetchFonts"
+    public static var mayFetchFonts: Bool { UserDefaults.standard.object(forKey: fetchFontsKey) as? Bool ?? true }
+
+    /// Makes the document's fonts available for edits (see `Fonts.prepare`), once per document per launch.
+    @discardableResult
+    public func prepareFonts(_ id: String, force: Bool = false) async -> [Fonts.Status] {
+        guard let rec = try? record(id) else { return [] }
+        if !force, let done = fontsPrepared[rec.id] { return done }
+        guard let doc = PDFDocument(url: library.pdfURL(for: rec.id)), !doc.isLocked else { return [] }
+        let status = await Fonts.prepare(doc, allowDownload: Self.mayFetchFonts)
+        fontsPrepared[rec.id] = status
+        return status
     }
 }

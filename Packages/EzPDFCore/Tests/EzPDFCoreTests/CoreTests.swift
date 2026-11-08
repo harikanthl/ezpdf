@@ -28,6 +28,14 @@ import PDFKit
 }
 
 @Suite struct TokenTests {
+    @Test func ocrCommaForDecimalPoint() {
+        #expect(Money.parse("4,804,68")?.value == 4804.68)
+        #expect(Money.parse("$1,234,567,89")?.value == 1234567.89)
+        #expect(Money.parse("1,234.56")?.value == 1234.56)
+        #expect(Money.parse("1.234,56")?.value == 1234.56)
+        #expect(Money.parse("12,34") == nil || Money.parse("12,34")?.value == 12.34)
+    }
+
     @Test(arguments: [("1,234.56", 1234.56, 0), ("(84.37)", 84.37, -1), ("-$12.00", 12.0, -1), ("600.00 DR", 600.0, -1),
                       ("58.20 CR", 58.2, 1), ("1.234,56", 1234.56, 0), ("$3,856.19", 3856.19, 0)])
     func money(_ s: String, _ v: Double, _ sign: Int) throws {
@@ -192,5 +200,47 @@ import PDFKit
         case .reject(let code, _)?: return code
         case nil: return -1
         }
+    }
+}
+
+@Suite struct ObjectFitTests {
+    @Test func signatureNeverClipped() {
+        let crop = CGRect(x: 0, y: 0, width: 612, height: 792)
+        for size in [18.0, 28.0, 40.0] {
+            let font = Objects.signatureFont(size: size)
+            let r = Objects.fitted(CGRect(x: 300, y: 100, width: 120, height: 24), text: "Harikanth Lingutla", font: font, page: crop)
+            let line = ("Harikanth Lingutla" as NSString).size(withAttributes: [.font: font])
+            #expect(r.height >= ceil(font.ascender - font.descender) + 8)   // room below the baseline for swashes
+            #expect(r.width >= line.width + 8)                              // one line, no wrapping
+            #expect(r.minY == 100)                                          // top edge stays put (top-left points)
+        }
+    }
+}
+
+@Suite struct ExtractionCheckTests {
+    func invoice(sub: Double?, tax: Double?, total: Double?, items: [(Double?, Double?, Double?)], issued: String? = "2026-10-14", due: String? = "2026-11-13") -> InvoiceResult {
+        InvoiceResult(vendor: "V", vendorAddress: nil, billTo: nil, invoiceNumber: "1", invoiceDate: issued, dueDate: due, poNumber: nil,
+                      currency: "USD", subtotal: sub, tax: tax, total: total, amountDue: nil,
+                      lineItems: items.enumerated().map { InvoiceLineItem(description: "Item \($0.offset)", quantity: $0.element.0, unitPrice: $0.element.1, amount: $0.element.2) },
+                      method: "test", warnings: [])
+    }
+
+    @Test func consistentInvoiceHasNoProblems() {
+        #expect(ExtractionCheck.problems(invoice(sub: 109, tax: 8.72, total: 117.72, items: [(2, 4.5, 9), (1, 100, 100)])).isEmpty)
+    }
+
+    @Test func findsWhatDoesntAddUp() {
+        let p = ExtractionCheck.problems(invoice(sub: 120, tax: 8, total: 130, items: [(2, 4.5, 9.5), (1, 100, 100)], due: "2026-09-01"))
+        #expect(p.contains { $0.contains("2 × 4.50 is 9.00, not 9.50") })
+        #expect(p.contains { $0.contains("add up to 109.50, but the subtotal is 120.00") })
+        #expect(p.contains { $0.contains("plus tax 8.00 is 128.00, but the total is 130.00") })
+        #expect(p.contains { $0.contains("before the invoice date") })
+    }
+
+    @Test func checksRunningBalances() {
+        let t = [Transaction(date: "2026-10-02", description: "A", amount: -10, balance: 90, page: 1, reconciled: false),
+                 Transaction(date: "2026-10-03", description: "B", amount: 5, balance: 96, page: 1, reconciled: false)]
+        let p = ExtractionCheck.problems(t, opening: 100)
+        #expect(p.count == 1 && p[0].contains("90.00 + 5.00 is 95.00, but the balance shows 96.00"))
     }
 }

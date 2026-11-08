@@ -66,18 +66,24 @@ final class ModelCatalogStore {
         loading = true
         lastError = nil
         defer { loading = false }
+        // Each source on its own: one failing keeps what it had before instead of emptying the list.
         var fresh: [Entry] = []
-        do {
-            try await fetchProviderModels()
-            fresh += try await fetchCatalogModels()
-        } catch {
+        var allOK = true
+        do { try await fetchProviderModels() } catch { allOK = false }
+        do { fresh += try await fetchCatalogModels() } catch {
+            allOK = false
             lastError = "Couldn't reach the model catalog: \(error.localizedDescription)"
+            fresh += entries.filter { $0.source == "catalog" }
         }
-        if ImageGen.isReady(.fal) { fresh += (try? await fetchFalImageModels()) ?? [] }
+        ImageGen.refreshKeyState()
+        if ImageGen.isReady(.fal) {
+            do { fresh += try await fetchFalImageModels() } catch { allOK = false; fresh += entries.filter { $0.source == "fal" } }
+        }
         guard !fresh.isEmpty else { return }
         entries = fresh
         updatedAt = Date()
-        UserDefaults.standard.set(updatedAt, forKey: Self.fetchedKey)
+        // Only a complete refresh resets the daily timer, so a partial one is retried next launch.
+        if allOK { UserDefaults.standard.set(updatedAt, forKey: Self.fetchedKey) }
         saveCache()
         publishImageModels()
     }
@@ -118,8 +124,11 @@ final class ModelCatalogStore {
         return models.compactMap { m in
             guard let id = m["id"] as? String else { return nil }
             let pricing = m["pricing"] as? [String: Any] ?? [:]
+            // "image" models that only read images (not make them) aren't image generators.
+            var category = (m["category"] as? String) ?? "text"
+            if category == "image", let outs = m["outputs"] as? [String], !outs.contains("image") { category = "vision" }
             func perMillion(_ k: String) -> Double? { (pricing[k] as? NSNumber).map { $0.doubleValue * 1_000_000 } }
-            return Entry(id: id, name: (m["name"] as? String) ?? id, provider: (m["provider"] as? String) ?? "", category: (m["category"] as? String) ?? "text",
+            return Entry(id: id, name: (m["name"] as? String) ?? id, provider: (m["provider"] as? String) ?? "", category: category,
                          source: "catalog", contextLength: m["contextLength"] as? Int, inputPrice: perMillion("prompt"),
                          outputPrice: perMillion("completion"), unitPrice: nil, supportsTools: m["supportsTools"] as? Bool,
                          blurb: m["blurb"] as? String, cheapToday: m["cheapToday"] as? Bool)
@@ -164,7 +173,12 @@ final class ModelCatalogStore {
     func route(for e: Entry) -> (preset: LLMProviderPreset, modelId: String) {
         let direct: [String: LLMProviderPreset] = ["anthropic": .anthropic, "openai": .openai, "google": .gemini, "x-ai": .xai]
         if let preset = direct[e.provider], let account = preset.keychainAccount, KeychainService.has(account) {
-            return (preset, e.id.split(separator: "/").last.map(String.init) ?? e.id)
+            // Catalog ids are OpenRouter style ("anthropic/claude-sonnet-4.5", "x-ai/grok-4:free"); the
+            // providers' own APIs want the bare name, and Anthropic spells versions with dashes.
+            var bare = e.id.split(separator: "/").last.map(String.init) ?? e.id
+            if let colon = bare.firstIndex(of: ":") { bare = String(bare[..<colon]) }
+            if preset == .anthropic { bare = bare.replacingOccurrences(of: ".", with: "-") }
+            return (preset, bare)
         }
         return (.openrouter, e.id)
     }

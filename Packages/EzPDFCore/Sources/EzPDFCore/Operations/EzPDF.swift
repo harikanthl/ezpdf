@@ -53,6 +53,20 @@ public final class EzPDF {
     }
 
     public init(library: Library = .shared) { self.library = library }
+    /// Full-text search over the library (in the library folder).
+    @ObservationIgnored lazy var searchIndex = SearchIndex(path: library.root.appendingPathComponent(".search.sqlite"))
+
+    func indexDocuments() -> [SearchIndex.Document] {
+        library.all().map { SearchIndex.Document(id: $0.id, title: $0.title, url: library.pdfURL(for: $0.id), modified: $0.modifiedAt) }
+    }
+
+    /// Indexes the library in the background, reading scanned pages too, so later searches find them.
+    public func refreshSearchIndex() async {
+        try? await searchIndex.refresh(indexDocuments(), ocr: true)
+    }
+
+    /// Fonts made ready per document this launch (see `prepareFonts`).
+    @ObservationIgnored var fontsPrepared: [String: [Fonts.Status]] = [:]
 
     // MARK: Jobs
 
@@ -267,7 +281,12 @@ public final class EzPDF {
             guard let page = doc.page(at: i) else { continue }
             var t = page.string ?? ""
             if t.trimmingCharacters(in: .whitespacesAndNewlines).count < 20 {
-                t = await PageText.ocrFragments(page: page, index: i).map(\.text).joined(separator: "\n")
+                // Scanned: read in reading order (paragraphs, columns in turn).
+                if let read = try? await DocumentReader.read(page: page, index: i), !read.paragraphs.isEmpty {
+                    t = read.text
+                } else {
+                    t = await PageText.ocrFragments(page: page, index: i).map(\.text).joined(separator: "\n")
+                }
             }
             let block = "--- Page \(i + 1) ---\n\(t.trimmingCharacters(in: .whitespacesAndNewlines))"
             parts.append(block)
@@ -286,6 +305,17 @@ public final class EzPDF {
     /// Searches off the main thread with its own PDFDocuments, so a big library doesn't freeze the UI.
     public func search(_ query: String, in id: String? = nil, limit: Int = 50) async throws -> [SearchHit] {
         guard query.trimmingCharacters(in: .whitespaces).count >= 2 else { throw EzPDFError.invalidInput("Search for at least 2 characters.") }
+        // The whole library: the full-text index, brought up to date first (fast: only changed documents).
+        if id == nil {
+            do {
+                try await searchIndex.refresh(indexDocuments())
+                return try await searchIndex.search(query, limit: limit).map {
+                    SearchHit(id: $0.id, title: $0.title, page: $0.page, snippet: $0.snippet)
+                }
+            } catch {
+                // The index couldn't be used: read the files instead (slower, same results for text pages).
+            }
+        }
         let recs = try id.map { [try record($0)] } ?? library.all()
         let files = recs.map { (id: $0.id, title: $0.title, url: library.pdfURL(for: $0.id)) }
         let limit = max(1, limit)
@@ -323,28 +353,75 @@ public final class EzPDF {
     // MARK: Edit
 
     /// Saves the current PDF as the undo point, then writes the new one.
-    private func commit(_ id: String, _ doc: PDFDocument) throws -> DocumentRecord {
+    private func commit(_ id: String, _ doc: PDFDocument, caller: String = #function) throws -> DocumentRecord {
         guard let data = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the change.") }
-        return try commit(id, data: data)
+        return try commit(id, data: data, caller: caller)
     }
 
-    func commitEditData(_ id: String, _ data: Data) throws -> DocumentRecord { try commit(id, data: data) }
+    func commitEditData(_ id: String, _ data: Data, caller: String = #function) throws -> DocumentRecord { try commit(id, data: data, caller: caller) }
 
-    private func commit(_ id: String, data: Data) throws -> DocumentRecord {
+    /// What a change was, for the log, from the operation that made it.
+    static func actionName(_ caller: String) -> String {
+        let name = String(caller.prefix { $0 != "(" })
+        let known: [String: String] = [
+            "pages": "Change pages", "addAnnotations": "Highlights and notes", "updateObject": "Move or edit a placed item",
+            "deleteObject": "Delete a placed item", "stamp": "Header and footer", "fillForm": "Fill in the form", "redact": "Redact",
+            "flatten": "Flatten", "makeFillable": "Make fillable", "replaceText": "Change text", "replaceSelection": "Change selected text",
+            "addContent": "Add content", "optimize": "Improve the PDF", "setProperties": "Properties", "removeAnnotations": "Remove annotations",
+            "sign": "Sign",
+        ]
+        if let k = known[name] { return k }
+        let words = name.replacingOccurrences(of: #"([a-z])([A-Z])"#, with: "$1 $2", options: .regularExpression).lowercased()
+        return words.prefix(1).uppercased() + words.dropFirst()
+    }
+
+    private func commit(_ id: String, data: Data, caller: String = #function) throws -> DocumentRecord {
         guard let check = PDFDocument(data: data), check.pageCount > 0 || check.isLocked else {
             throw EzPDFError.failed("That change produced a broken PDF, so it wasn't saved.")
         }
         let current = library.pdfURL(for: id)
-        let backup = library.folder(for: id).appendingPathComponent("document.prev.pdf")
-        let staging = library.folder(for: id).appendingPathComponent(".document.prev.\(UUID().uuidString).pdf")
+        let history = EditHistory(folder: library.folder(for: id))
         do {
-            try FileManager.default.copyItem(at: current, to: staging)
-            _ = try FileManager.default.replaceItemAt(backup, withItemAt: staging)
+            try history.push(current, to: history.undoDir)
         } catch {
-            try? FileManager.default.removeItem(at: staging)
             throw EzPDFError.failed("Couldn't keep an undo copy, so the change wasn't made: \(error.localizedDescription)")
         }
-        return try library.replacePDF(id, with: data)
+        let saved: DocumentRecord
+        do {
+            saved = try library.replacePDF(id, with: data)
+        } catch {
+            // The change didn't happen: take back the undo step it would have had.
+            if let step = history.newest(history.undoDir) { try? FileManager.default.removeItem(at: step) }
+            throw error
+        }
+        history.clearRedo()
+        history.trim()
+        collectGarbage(id)
+        logChange(id, fallback: Self.actionName(caller))
+        return saved
+    }
+
+    /// Placed images no kept version uses (deleted, on deleted pages, past the undo limit) are cleared out.
+    private func collectGarbage(_ id: String) {
+        let history = EditHistory(folder: library.folder(for: id))
+        Objects.collectGarbage(folder: library.folder(for: id), versions: [library.pdfURL(for: id)] + history.versions)
+    }
+
+    public func canUndo(_ id: String) -> Bool { EditHistory(folder: library.folder(for: id)).canUndo }
+    public func canRedo(_ id: String) -> Bool { EditHistory(folder: library.folder(for: id)).canRedo }
+
+    /// A new document made from pages of others. Placed objects get fresh ids and their image files
+    /// come along; if the files can't be copied, the new document isn't kept.
+    private func addDerived(_ record: DocumentRecord, _ doc: PDFDocument, images: [Objects.ImageCopy]) throws -> DocumentRecord {
+        guard let data = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't make “\(record.title)”.") }
+        let new = try library.add(record, pdfData: data)
+        do {
+            try Objects.copyImages(images, to: library.folder(for: new.id))
+        } catch {
+            try? library.delete(new.id)
+            throw error
+        }
+        return new
     }
 
     /// Adds annotations made in the reader onto the current file (not over it), with an undo point.
@@ -360,14 +437,45 @@ public final class EzPDF {
         return try commit(rec.id, doc)
     }
 
-    /// Restores the version before the last edit.
+    /// Restores the version before the last change (as many steps back as are kept).
     @discardableResult
     public func undo(_ id: String) throws -> DocumentRecord {
         let rec = try record(id, strict: true)
-        let backup = library.folder(for: rec.id).appendingPathComponent("document.prev.pdf")
-        guard let data = try? Data(contentsOf: backup) else { throw EzPDFError.invalidInput("Nothing to undo for “\(rec.title)”.") }
-        let out = try library.replacePDF(rec.id, with: data)
-        try? FileManager.default.removeItem(at: backup)
+        let history = EditHistory(folder: library.folder(for: rec.id))
+        guard let step = history.newest(history.undoDir) else { throw EzPDFError.invalidInput("Nothing to undo for “\(rec.title)”.") }
+        let out = try swap(rec, with: step, saveCurrentTo: history.redoDir, history: history)
+        log(rec.id, by: Self.actor?.by ?? "You", action: "Undo", detail: "", ok: true, result: "")
+        return out
+    }
+
+    /// Puts back the change the last Undo took away.
+    @discardableResult
+    public func redo(_ id: String) throws -> DocumentRecord {
+        let rec = try record(id, strict: true)
+        let history = EditHistory(folder: library.folder(for: rec.id))
+        guard let step = history.newest(history.redoDir) else { throw EzPDFError.invalidInput("Nothing to redo for “\(rec.title)”.") }
+        let out = try swap(rec, with: step, saveCurrentTo: history.undoDir, history: history)
+        log(rec.id, by: Self.actor?.by ?? "You", action: "Redo", detail: "", ok: true, result: "")
+        return out
+    }
+
+    /// Makes `step` the current version and keeps the current one on the other side. If anything
+    /// fails, the document stays as it was.
+    private func swap(_ rec: DocumentRecord, with step: URL, saveCurrentTo other: URL, history: EditHistory) throws -> DocumentRecord {
+        let data = try Data(contentsOf: step)
+        guard let check = PDFDocument(data: data), check.pageCount > 0 || check.isLocked else {
+            try? FileManager.default.removeItem(at: step)
+            throw EzPDFError.failed("That saved version is damaged, so it was dropped. Try again for the one before it.")
+        }
+        try history.push(library.pdfURL(for: rec.id), to: other)
+        let out: DocumentRecord
+        do {
+            out = try library.replacePDF(rec.id, with: data)
+        } catch {
+            if let pushed = history.newest(other) { try? FileManager.default.removeItem(at: pushed) }
+            throw error
+        }
+        try? FileManager.default.removeItem(at: step)
         return out
     }
 
@@ -397,7 +505,15 @@ public final class EzPDF {
             return PageResult(document: try commit(rec.id, doc), created: [])
         case .duplicate:
             let indices = try PageOps.pages(spec, count: doc.pageCount)
-            for i in indices.sorted(by: >) { if let p = doc.page(at: i)?.copy() as? PDFPage { doc.insert(p, at: i + 1) } }
+            let folder = library.folder(for: rec.id)
+            var images: [Objects.ImageCopy] = []
+            for i in indices.sorted(by: >) {
+                guard let p = doc.page(at: i)?.copy() as? PDFPage else { continue }
+                // The copy's objects are new objects: own ids, own image files.
+                images += Objects.reassignIDs(on: p, sourceFolder: folder)
+                doc.insert(p, at: i + 1)
+            }
+            try Objects.copyImages(images, to: folder)
             return PageResult(document: try commit(rec.id, doc), created: [])
         case .insert_blank:
             let after = (try PageOps.pages(spec ?? "last", count: doc.pageCount)).last ?? doc.pageCount - 1
@@ -405,15 +521,15 @@ public final class EzPDF {
             return PageResult(document: try commit(rec.id, doc), created: [])
         case .extract:
             let sub = PageOps.extract(doc, pages: try PageOps.pages(spec, count: doc.pageCount))
-            guard let data = sub.dataRepresentation() else { throw EzPDFError.failed("Couldn't extract the pages.") }
-            let new = try library.add(DocumentRecord(title: "\(rec.title) (pages \(spec ?? "all"))", kind: .file, preset: rec.preset), pdfData: data)
+            let images = Objects.reassignIDs(sub, sourceFolder: library.folder(for: rec.id))
+            let new = try addDerived(DocumentRecord(title: "\(rec.title) (pages \(spec ?? "all"))", kind: .file, preset: rec.preset), sub, images: images)
             return PageResult(document: rec, created: [new])
         case .split:
             let parts = try PageOps.split(doc, every: every, at: startPages)
             var created: [DocumentRecord] = []
             for (i, part) in parts.enumerated() {
-                guard let data = part.dataRepresentation() else { continue }
-                created.append(try library.add(DocumentRecord(title: "\(rec.title), part \(i + 1)", kind: .file, preset: rec.preset), pdfData: data))
+                let images = Objects.reassignIDs(part, sourceFolder: library.folder(for: rec.id))
+                created.append(try addDerived(DocumentRecord(title: "\(rec.title), part \(i + 1)", kind: .file, preset: rec.preset), part, images: images))
             }
             return PageResult(document: rec, created: created)
         }
@@ -423,13 +539,16 @@ public final class EzPDF {
         guard ids.count >= 2 else { throw EzPDFError.invalidInput("Merge needs at least two documents.") }
         let merged = PDFDocument()
         var titles: [String] = []
+        var images: [Objects.ImageCopy] = []
         for id in ids {
             let (rec, doc) = try document(id)
+            // Fresh ids per source (the same document can be merged twice), files from its folder.
+            images += Objects.reassignIDs(doc, sourceFolder: library.folder(for: rec.id))
             PageOps.append(doc, to: merged)
             titles.append(rec.title)
         }
-        guard let data = merged.dataRepresentation() else { throw EzPDFError.failed("Couldn't merge.") }
-        return try library.add(DocumentRecord(title: title ?? titles.prefix(2).joined(separator: " + ") + (titles.count > 2 ? " + …" : ""), kind: .merged), pdfData: data)
+        return try addDerived(DocumentRecord(title: title ?? titles.prefix(2).joined(separator: " + ") + (titles.count > 2 ? " + …" : ""), kind: .merged),
+                              merged, images: images)
     }
 
     public enum Optimization: String, Codable, Sendable, CaseIterable {

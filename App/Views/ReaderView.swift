@@ -3,6 +3,12 @@ import UniformTypeIdentifiers
 import PDFKit
 import EzPDFCore
 
+/// Lets a selection drive `.sheet(item:)`.
+struct IdentifiedSelection: Identifiable {
+    let id = UUID()
+    let info: EditOps.SelectionInfo
+}
+
 struct ReaderView: View {
     let record: DocumentRecord
     @Environment(AppModel.self) private var app
@@ -24,14 +30,16 @@ struct ReaderView: View {
     @State private var editTool: EditTool?
     @State private var placed: (tool: EditTool, page: Int, rect: CGRect)?
     @State private var showPlacement = false
-    @State private var replacing: (text: String, page: Int)?
-    @State private var showReplace = false
+    @State private var replacing: EditOps.SelectionInfo?
     @State private var editingObject: ObjectEditSheet.Model?
     @State private var showHeaderFooter = false
     @State private var marking = false
     @State private var showLogoGen = false
+    @State private var savingTemplate = false
+    @State private var showHistory = false
+    @State private var templateName = ""
     @State private var dropTargeted = false
-    @State private var strokes: [[CGPoint]] = []
+    @State private var strokes: [ReaderController.PenStroke] = []
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -49,6 +57,14 @@ struct ReaderView: View {
         .toolbar { toolbar }
         .onAppear {
             reload(page: app.openPage); app.openPage = nil
+            reader.onError = { app.show($0, error: true) }
+            // Ready the document's own fonts in the background, so edits match its type.
+            let id = record.id
+            Task.detached(priority: .utility) { _ = await EzPDF.shared.prepareFonts(id) }
+            let r = reader
+            app.flushPendingEdits = { [weak r] in r?.flushAnnotations() }
+            app.assistant.beforeEdit = { [weak r] in r?.flushAnnotations() }
+            reader.onPasteImage = { placeImage($0, atView: nil) }
             reader.onEditObject = { id, a in
                 editingObject = .init(id: id, isText: a.type == "FreeText", text: a.contents ?? "",
                                       font: a.font?.fontName ?? ".AppleSystemUIFont", size: Double(a.font?.pointSize ?? 12),
@@ -81,15 +97,21 @@ struct ReaderView: View {
                 catch { app.show(error.localizedDescription, error: true) }
             }
         }
+        .sheet(isPresented: $showHistory) { HistorySheet(record: record) }
+        .alert("Save as Template", isPresented: $savingTemplate) {
+            TextField("Name", text: $templateName)
+            Button("Save") { saveAsTemplate() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("It appears in Templates under My Templates, ready to fill in again.")
+        }
         .sheet(item: $editingObject) { m in
             ObjectEditSheet(model: m, onSave: { saveObject($0) }, onDelete: { deleteObject(m.id) })
         }
-        .sheet(isPresented: $showReplace) {
-            if let replacing {
-                ReplaceSheet(original: replacing.text) { new in replaceSelection(replacing.text, with: new, page: replacing.page) }
-            }
+        .sheet(item: Binding(get: { replacing.map { IdentifiedSelection(info: $0) } }, set: { replacing = $0?.info })) { sel in
+            ReplaceSheet(original: sel.info.text) { new in replaceSelection(sel.info, with: new) }
         }
-        .onDisappear { reader.flushAnnotations(); reader.stopSpeaking() }
+        .onDisappear { reader.flushAnnotations(); reader.stopSpeaking(); app.assistant.beforeEdit = {}; app.flushPendingEdits = {} }
         .sheet(isPresented: $showSummary) {
             VStack(alignment: .leading, spacing: 12) {
                 Label("Summary", systemImage: "apple.intelligence").font(.title3.weight(.semibold))
@@ -155,7 +177,8 @@ struct ReaderView: View {
             PagesView(record: record, beforeEdit: { reader.flushAnnotations() })
         }
         if marking, mode == .read {
-            MarkOverlay(strokes: $strokes, onStrokeEnded: {
+            MarkOverlay(strokes: $strokes, anchor: { reader.anchor($0) }, toView: { reader.viewPoints($0) },
+                        viewport: reader.viewport, onStrokeEnded: {
                 withAnimation(Motion.outFast) { app.assistant.mark = strokes.isEmpty ? nil : reader.mark(from: strokes) }
             }, onDone: { stopMarking() })
             .transition(.opacity)
@@ -304,11 +327,14 @@ struct ReaderView: View {
                 }
                 Divider()
                 Button {
-                    if let sel = reader.selectionForEdit { replacing = sel; showReplace = true }
-                    else { app.show("Select the text to change first.", error: true) }
+                    if let sel = reader.selectionForEdit { replacing = sel }
+                    else { app.show("Select the text to change first: drag across it on the page.", error: true) }
                 } label: { Label("Change Selected Text…", systemImage: "character.cursor.ibeam") }
                 Button { showLogoGen = true } label: { Label("Generate Logo or Image…", systemImage: "wand.and.stars") }
                 Button { showHeaderFooter = true } label: { Label("Header, Footer & Page Numbers…", systemImage: "rectangle.topthird.inset.filled") }
+                Divider()
+                Button { makeFillable() } label: { Label("Make Fillable (Find the Blanks)", systemImage: "rectangle.and.pencil.and.ellipsis") }
+                Button { templateName = record.title; savingTemplate = true } label: { Label("Save as Template…", systemImage: "square.on.square.badge.person.crop") }
                 Button { optimizeFlatten() } label: { Label("Flatten Annotations and Forms", systemImage: "square.3.layers.3d.down.right") }
             } label: { Image(systemName: "pencil.tip.crop.circle") }
             .help("Edit: add text, sign, images, boxes, white-out, redact, change text")
@@ -330,6 +356,7 @@ struct ReaderView: View {
             Menu {
                 Button("Summarize on This Mac") { summarize() }.disabled(!app.ops.canSummarize)
                 Button("Add Note to This Page…") { showNote = true }.disabled(mode != .read)
+                Button("History…") { reader.flushAnnotations(); showHistory = true }
                 Divider()
                 Button("Save PDF to Downloads") { app.export(record, as: .pdf) }
                 if record.hasEPUB { Button("Save EPUB to Downloads") { app.export(record, as: .epub) } }
@@ -339,7 +366,8 @@ struct ReaderView: View {
                 Button("Make Text Searchable (OCR)") { optimize(.make_searchable) }
                 Button("Add Page Numbers") { optimize(.page_numbers) }
                 Divider()
-                Button("Undo Last Change") { undo() }
+                Button("Undo") { app.undoDocument(redo: false) }.disabled(!app.ops.canUndo(record.id))
+                Button("Redo") { app.undoDocument(redo: true) }.disabled(!app.ops.canRedo(record.id))
                 Button("Show in Finder") { app.revealInLibrary(record) }
                 if let src = record.sourceURL, let u = URL(string: src) { Button("Open Original Page") { NSWorkspace.shared.open(u) } }
             } label: { Image(systemName: "ellipsis.circle") }
@@ -407,25 +435,22 @@ struct ReaderView: View {
         withoutAnimation { marking = false }
     }
 
+    /// Images dropped on a page become movable objects (each one a little lower and to the right
+    /// of the last). Anything that isn't an image is left for other drop targets.
     private func handleImageDrop(_ providers: [NSItemProvider], at point: CGPoint) -> Bool {
-        let imageExts: Set<String> = ["png", "jpg", "jpeg", "heic", "gif", "tif", "tiff", "webp", "svg", "bmp"]
-        for p in providers {
-            if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-                _ = p.loadObject(ofClass: URL.self) { url, _ in
-                    guard let url, imageExts.contains(url.pathExtension.lowercased()), let data = try? Data(contentsOf: url) else { return }
-                    Task { @MainActor in placeImage(data, atView: point) }
+        // Finder files carry their own type, so "is it an image" works for files and for pasted pictures.
+        let images = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.image.identifier) }
+        guard !images.isEmpty else { return false }
+        for (i, p) in images.prefix(12).enumerated() {
+            let at = CGPoint(x: point.x + CGFloat(i) * 24, y: point.y + CGFloat(i) * 24)
+            p.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                Task { @MainActor in
+                    guard let data else { app.show("That image couldn't be read.", error: true); return }
+                    placeImage(data, atView: at)
                 }
-                return true
-            }
-            if p.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                p.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
-                    guard let data else { return }
-                    Task { @MainActor in placeImage(data, atView: point) }
-                }
-                return true
             }
         }
-        return false
+        return true
     }
 
     /// Puts an image on the page as a movable object: where it was dropped, or near the top left of
@@ -471,23 +496,57 @@ struct ReaderView: View {
         }
     }
 
+    /// The page (1-based) the selected object is on, so a lookup prefers it.
+    private var selectedObjectPage: Int? {
+        reader.pdfView.selectedPage.flatMap { reader.pdfView.document?.index(for: $0) }.map { $0 + 1 }
+    }
+
     private func saveObject(_ m: ObjectEditSheet.Model) {
+        reader.flushAnnotations()
         do {
-            _ = try app.ops.updateObject(record.id, object: m.id, .init(
+            _ = try app.ops.updateObject(record.id, object: m.id, onPage: selectedObjectPage, .init(
                 text: m.isText ? m.text : nil, fontName: m.isText ? m.font : nil, fontSize: m.isText ? CGFloat(m.size) : nil,
                 color: NSColor(m.color)))
         } catch { app.show(error.localizedDescription, error: true) }
     }
 
     private func deleteObject(_ id: String) {
-        do { _ = try app.ops.deleteObject(record.id, object: id) } catch { app.show(error.localizedDescription, error: true) }
+        reader.flushAnnotations()
+        do { _ = try app.ops.deleteObject(record.id, object: id, onPage: selectedObjectPage) } catch { app.show(error.localizedDescription, error: true) }
     }
 
-    private func replaceSelection(_ old: String, with new: String, page: Int) {
+    /// Returns nil when the change was made, else a message for the sheet.
+    private func replaceSelection(_ info: EditOps.SelectionInfo, with new: String) -> String? {
         reader.flushAnnotations()
         do {
-            let r = try app.ops.replaceText(record.id, find: old, with: new, pages: "\(page)", matchCase: true)
-            app.show("Changed \(r.changes.count) place\(r.changes.count == 1 ? "" : "s") on page \(page)")
+            let r = try app.ops.replaceSelection(record.id, info, with: new)
+            reader.pdfView.clearSelection()
+            let done = new.isEmpty ? "Erased on page \(info.page + 1)" : "Changed on page \(info.page + 1)"
+            app.show(([done] + r.notes).joined(separator: ". "))
+            return nil
+        } catch { return error.localizedDescription }
+    }
+
+    /// Finds the writing lines, boxes, checkboxes and signature lines and makes each a form field.
+    private func makeFillable() {
+        reader.flushAnnotations()
+        withAnimation(reduceMotion ? nil : Motion.out) { busy = "Finding the blanks…" }
+        Task {
+            defer { withAnimation(reduceMotion ? nil : Motion.outFast) { busy = nil } }
+            do {
+                let r = try await app.ops.makeFillable(record.id)
+                var note = "Added \(r.fields.count) field\(r.fields.count == 1 ? "" : "s"). Click one to type, or ask the assistant to fill them in."
+                if !r.skippedRotated.isEmpty { note += " Rotated pages with notes were left as they were." }
+                app.show(note, documentID: record.id)
+            } catch { app.show(error.localizedDescription, error: true) }
+        }
+    }
+
+    private func saveAsTemplate() {
+        reader.flushAnnotations()
+        do {
+            let t = try app.ops.saveTemplate(record.id, name: templateName)
+            app.show("Saved “\(t.name)” to My Templates (\(t.fields.count) fields)")
         } catch { app.show(error.localizedDescription, error: true) }
     }
 
@@ -507,10 +566,5 @@ struct ReaderView: View {
         } catch { app.show(error.localizedDescription, error: true) }
     }
 
-    private func undo() {
-        reader.flushAnnotations()
-        do { _ = try app.ops.undo(record.id); app.show("Restored the previous version") }
-        catch { app.show(error.localizedDescription, error: true) }
-    }
 }
 

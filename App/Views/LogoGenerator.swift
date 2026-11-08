@@ -16,6 +16,9 @@ struct LogoGeneratorSheet: View {
     @State private var cutOut = true
     @State private var working = false
     @State private var error: String?
+    @State private var job: Task<Void, Never>?
+    @State private var images: [NSImage] = []      // decoded once, not on every redraw
+    @State private var ready: [ImageGen.Provider: Bool] = [:]
 
     private var model: ImageGen.Model { ImageGen.model(id: modelID) }
 
@@ -33,7 +36,7 @@ struct LogoGeneratorSheet: View {
             HStack {
                 Picker("Model", selection: $modelID) {
                     ForEach(ImageGen.allModels) { m in
-                        Text(m.name + (ImageGen.isReady(m.provider) ? "" : " (add key)")).tag(m.id)
+                        Text(m.name + (ready[m.provider, default: true] ? "" : " (add key)")).tag(m.id)
                     }
                 }
                 .frame(width: 260)
@@ -44,22 +47,26 @@ struct LogoGeneratorSheet: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 10, style: .continuous).fill(.quaternary.opacity(0.35))
                 if working {
-                    VStack(spacing: 8) { ProgressView(); Text("Making images…").font(.caption).foregroundStyle(.secondary) }
+                    VStack(spacing: 8) {
+                        ProgressView(); Text("Making images…").font(.caption).foregroundStyle(.secondary)
+                        Button("Stop") { job?.cancel() }.buttonStyle(PressableStyle())
+                    }
                 } else if let error {
                     Text(error).font(.callout).foregroundStyle(.orange).multilineTextAlignment(.center).padding()
                 } else if results.isEmpty {
                     Text("Your options appear here.").font(.callout).foregroundStyle(.tertiary)
                 } else {
                     HStack(spacing: 12) {
-                        ForEach(Array(results.enumerated()), id: \.offset) { i, d in
-                            if let img = NSImage(data: d) {
+                        ForEach(Array(images.enumerated()), id: \.offset) { i, img in
+                            Group {
                                 Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
                                     .frame(width: 150, height: 150)
                                     .padding(6)
                                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.white))
                                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(picked == i ? Color.accentColor : .clear, lineWidth: 2.5))
-                                    .onTapGesture { picked = i }
+                                    // Double first, so a double click isn't eaten by the single tap.
                                     .onTapGesture(count: 2) { picked = i; place() }
+                                    .onTapGesture { picked = i }
                             }
                         }
                     }
@@ -73,32 +80,53 @@ struct LogoGeneratorSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { dismiss() }.buttonStyle(PressableStyle()).keyboardShortcut(.cancelAction)
-                Button(results.isEmpty ? "Generate" : "Again") { generate() }.buttonStyle(PressableStyle()).disabled(prompt.isEmpty || working)
+                Button(results.isEmpty ? "Generate" : "Again") { generate() }.buttonStyle(PressableStyle()).disabled(trimmedPrompt.isEmpty || working)
                 Button("Place on Page") { place() }.buttonStyle(PressableStyle(prominent: true)).keyboardShortcut(.defaultAction)
                     .disabled(picked == nil || working)
             }
         }
         .padding(18)
+        .onAppear {
+            ImageGen.refreshKeyState()
+            ready = Dictionary(uniqueKeysWithValues: ImageGen.Provider.allCases.map { ($0, ImageGen.isReady($0)) })
+            if ImageGen.savedModel(id: modelID) == nil, modelID != "apple" {
+                error = "The model you picked before isn't available anymore; using \(model.name)."
+            }
+        }
+        .onDisappear { job?.cancel() }      // closing the sheet stops (and cancels) the remote job
     }
 
+    private var trimmedPrompt: String { prompt.trimmingCharacters(in: .whitespacesAndNewlines) }
+
     private func generate() {
-        guard !prompt.isEmpty, !working else { return }
+        guard !trimmedPrompt.isEmpty, !working else { return }
         working = true; error = nil; picked = nil
-        Task {
+        let m = model, p = ImageGen.prompt(trimmedPrompt, style: style)
+        job = Task {
             defer { working = false }
             do {
-                results = try await ImageGen.generate(prompt: ImageGen.prompt(prompt, style: style), model: model, count: model.provider == .apple ? 2 : 3)
-                picked = results.isEmpty ? nil : 0
-            } catch { self.error = error.localizedDescription }
+                let out = try await ImageGen.generate(prompt: p, model: m, count: m.provider == .apple ? 2 : 3)
+                guard !Task.isCancelled else { return }
+                results = out
+                images = out.compactMap(NSImage.init(data:))
+                picked = images.isEmpty ? nil : 0
+            } catch {
+                if !Task.isCancelled { self.error = error.localizedDescription }
+            }
         }
     }
 
     private func place() {
-        guard let picked, picked < results.count else { return }
-        var data = results[picked]
-        if cutOut, let cut = try? ImageGen.removeBackground(data) { data = cut }
-        onPlace(data)
-        dismiss()
+        guard let picked, picked < results.count, !working else { return }
+        let data = results[picked], lettering = style.isLettering, cut = cutOut
+        working = true
+        job = Task {
+            defer { working = false }
+            let out = cut ? ((try? await ImageGen.removeBackground(data, lettering: lettering)) ?? data) : data
+            guard !Task.isCancelled else { return }
+            onPlace(out)
+            dismiss()
+        }
     }
 }
 
@@ -108,6 +136,7 @@ struct ImageKeysSection: View {
     @State private var openAIKey = ""
     @State private var hasFal = ImageGen.isReady(.fal)
     @State private var hasOpenAI = ImageGen.isReady(.openai)
+    @State private var keyError: String?
 
     var body: some View {
         Section {
@@ -116,7 +145,10 @@ struct ImageKeysSection: View {
         } header: {
             Text("Images and logos")
         } footer: {
-            Text("Apple Image Playground works without a key. fal.ai and OpenAI keys stay in your Keychain.").font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 4) {
+                if let keyError { Text(keyError).font(.caption).foregroundStyle(.orange) }
+                Text("Apple Image Playground works without a key. fal.ai and OpenAI keys stay in your Keychain.").font(.caption).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -125,9 +157,11 @@ struct ImageKeysSection: View {
             HStack {
                 SecureField(saved.wrappedValue ? "Saved in the Keychain" : "Paste key", text: text).textFieldStyle(.roundedBorder)
                 Button("Save") {
-                    ImageGen.setKey(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines), for: provider)
-                    text.wrappedValue = ""; saved.wrappedValue = ImageGen.isReady(provider)
-                }.disabled(text.wrappedValue.isEmpty)
+                    let status = ImageGen.setKey(text.wrappedValue, for: provider)
+                    text.wrappedValue = ""
+                    saved.wrappedValue = ImageGen.isReady(provider)
+                    keyError = status == errSecSuccess ? nil : "Couldn't save to the Keychain (error \(status))."
+                }.disabled(text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 if saved.wrappedValue {
                     Button("Remove") { ImageGen.setKey(nil, for: provider); saved.wrappedValue = false }
                     Label("Saved", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.caption)

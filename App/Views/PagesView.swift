@@ -90,7 +90,8 @@ struct PagesView: View {
                 Button("Split at Selected Pages") { split(starts: selected.sorted().map { $0 + 1 }) }.disabled(selected.isEmpty)
                 Divider()
                 Button("Insert Blank Page After Selection") { run(.insert_blank) }
-                Button("Undo Last Change") { undo() }
+                Button("Undo") { beforeEdit(); app.undoDocument(redo: false) }.disabled(!app.ops.canUndo(record.id))
+                Button("Redo") { beforeEdit(); app.undoDocument(redo: true) }.disabled(!app.ops.canRedo(record.id))
             } label: { Image(systemName: "scissors") }
             .menuStyle(.borderlessButton).frame(width: 36)
             .help("Split, insert, undo")
@@ -219,8 +220,4 @@ struct PagesView: View {
         perform { try app.ops.pages(record.id, action: .split, every: every, startPages: starts) }
     }
 
-    private func undo() {
-        beforeEdit()
-        do { _ = try app.ops.undo(record.id) } catch { app.show(error.localizedDescription, error: true) }
-    }
 }

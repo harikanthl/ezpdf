@@ -38,20 +38,20 @@ public enum Stamps {
         let author = attrs[PDFDocumentAttribute.authorAttribute] as? String ?? ""
         let total = doc.pageCount
         let font = EditOps.font(named: c.fontName, size: c.fontSize)
-        let logo: CGImage? = c.logo.flatMap { d in
-            CGImageSourceCreateWithData(d as CFData, nil).flatMap {
-                CGImageSourceCreateThumbnailAtIndex($0, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                                            kCGImageSourceCreateThumbnailWithTransform: true,
-                                                            kCGImageSourceThumbnailMaxPixelSize: 1200] as CFDictionary)
+        var logo: CGImage?
+        if let d = c.logo {
+            guard let img = PDFRaster.decodeImage(d, maxPixels: 1200) else {
+                throw EzPDFError.invalidInput("The logo image couldn't be read. Use PNG, JPEG, HEIC, TIFF, GIF, WebP or SVG.")
             }
+            logo = img
         }
-        var stamped = 0
+        var byPage: [Int: [EditOps.Overlay]] = [:]
         var bates = c.batesStart
         for i in 0..<total {
             if c.skipFirstPage && i == 0 { continue }
             if let pages = c.pages, !pages.contains(i) { continue }
             guard let page = doc.page(at: i) else { continue }
-            let size = page.bounds(for: .cropBox).size
+            let size = EditOps.PageSpace(page).size          // as shown, after rotation
             let m = max(18, min(c.margin, min(size.width, size.height) / 4))
             let mirror = c.mirrorEvenPages && (i + 1) % 2 == 0
             func fill(_ s: String) -> String {
@@ -89,32 +89,47 @@ public enum Stamps {
                 overlays.append(.image(logo, rect: CGRect(x: x, y: max(4, y), width: w, height: h)))
             }
             guard !overlays.isEmpty else { continue }
-            try EditOps.compose(doc, page: i, overlays: overlays)
-            stamped += 1
+            byPage[i] = overlays
             bates += 1
         }
-        return stamped
+        // All pages in one pass, so the stamp's font is embedded once for the whole document.
+        try EditOps.compose(doc, overlays: byPage)
+        return byPage.count
     }
 
-    /// Replaces tokens; longer ones first so "@date{…}" isn't read as "@date".
+    static let token = try! NSRegularExpression(pattern: #"@@|@date\{([^}]{1,50})\}|@[a-z_]+"#)
+
+    /// Replaces tokens in one pass, so text that comes in through a token (a file named
+    /// "report@page.pdf") is never read as another token. Tokens are whole words: "@page" is a
+    /// token, "@pages" and "name@pagesmith.com" are left alone.
     static func expand(_ s: String, page: Int, total: Int, title: String, author: String, fileName: String, bates: String, now: Date = Date()) -> String {
         guard s.contains("@") else { return s }
-        var t = s.replacingOccurrences(of: "@@", with: "\u{1}")
-        // @date{format} (format limited to 50 characters)
-        while let r = t.range(of: #"@date\{([^}]{1,50})\}"#, options: .regularExpression) {
-            let fmt = String(t[r].dropFirst(6).dropLast())
-            let f = DateFormatter(); f.dateFormat = fmt
-            t.replaceSubrange(r, with: f.string(from: now))
-        }
         let d = DateFormatter(); d.dateStyle = .long
         let tm = DateFormatter(); tm.timeStyle = .short
-        let pairs: [(String, String)] = [
-            ("@total_pages", "\(total)"), ("@page_count", "\(total)"), ("@page_number", "\(page)"), ("@filename", fileName),
-            ("@datetime", d.string(from: now) + " " + tm.string(from: now)), ("@author", author), ("@title", title),
-            ("@total", "\(total)"), ("@bates", bates), ("@date", d.string(from: now)), ("@time", tm.string(from: now)),
-            ("@year", String(Calendar.current.component(.year, from: now))), ("@page", "\(page)"),
+        let values: [String: String] = [
+            "@total_pages": "\(total)", "@page_count": "\(total)", "@page_number": "\(page)", "@filename": fileName,
+            "@datetime": d.string(from: now) + " " + tm.string(from: now), "@author": author, "@title": title,
+            "@total": "\(total)", "@bates": bates, "@date": d.string(from: now), "@time": tm.string(from: now),
+            "@year": String(Calendar.current.component(.year, from: now)), "@page": "\(page)",
         ]
-        for (k, v) in pairs { t = t.replacingOccurrences(of: k, with: v) }
-        return t.replacingOccurrences(of: "\u{1}", with: "@")
+        let ns = s as NSString
+        var out = ""
+        var last = 0
+        for m in token.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+            out += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+            let t = ns.substring(with: m.range)
+            if t == "@@" {
+                out += "@"
+            } else if m.range(at: 1).location != NSNotFound {
+                let f = DateFormatter(); f.dateFormat = ns.substring(with: m.range(at: 1))
+                out += f.string(from: now)
+            } else {
+                // Unknown words after @ (an email address, a handle) stay exactly as typed.
+                out += values[t] ?? t
+            }
+            last = m.range.location + m.range.length
+        }
+        out += ns.substring(from: last)
+        return out
     }
 }

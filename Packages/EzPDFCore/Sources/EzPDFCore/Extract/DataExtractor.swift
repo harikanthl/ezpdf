@@ -64,12 +64,21 @@ public enum DataExtractor {
             if s.transactions.isEmpty, useAI, AIExtractor.isAvailable {
                 let pages = Dictionary(grouping: lines, by: \.page).sorted { $0.key < $1.key }
                     .map { (page: $0.key + 1, text: $0.value.map(\.text).joined(separator: "\n")) }
-                if let t = try? await AIExtractor.transactions(pages: pages), !t.isEmpty {
+                // Read, check the balances, and read again with what didn't add up (at most twice).
+                var best: (rows: [Transaction], problems: [String])?
+                for _ in 0..<3 {
+                    guard let t = try? await AIExtractor.transactions(pages: pages, problems: best?.problems ?? []), !t.isEmpty else { break }
+                    let problems = ExtractionCheck.problems(t, opening: s.openingBalance)
+                    if best == nil || problems.count < best!.problems.count { best = (t, problems) }
+                    if problems.isEmpty { break }
+                }
+                if let best {
+                    let t = best.rows
                     s.transactions = t
                     s.totalIn = t.filter { $0.amount > 0 }.reduce(0) { $0 + $1.amount }
                     s.totalOut = t.filter { $0.amount < 0 }.reduce(0) { $0 - $1.amount }
                     s.method = "apple-intelligence"
-                    s.warnings = ["Read by Apple Intelligence because the layout wasn't recognized. Check the rows."]
+                    s.warnings = ["Read by Apple Intelligence because the layout wasn't recognized. Check the rows."] + best.problems
                 }
             }
             return ExtractionResult(kind: .statement, statement: s)
@@ -77,11 +86,23 @@ public enum DataExtractor {
             var inv = InvoiceParser.parse(lines)
             if useAI, AIExtractor.isAvailable {
                 let text = lines.map(\.text).joined(separator: "\n")
-                if let ai = try? await AIExtractor.invoice(text: text) { inv = merge(layout: inv, ai: ai) }
+                // Read, check the numbers against each other, and read again with what didn't add up (at most twice).
+                var best: (inv: InvoiceResult, problems: [String])?
+                for _ in 0..<3 {
+                    guard let ai = try? await AIExtractor.invoice(text: text, problems: best?.problems ?? []) else { break }
+                    let merged = merge(layout: inv, ai: ai)
+                    let problems = ExtractionCheck.problems(merged)
+                    if best == nil || problems.count < best!.problems.count { best = (merged, problems) }
+                    if problems.isEmpty { break }
+                }
+                if let best { inv = best.inv }
             }
+            // Whatever read it, say where the numbers don't agree.
+            for p in ExtractionCheck.problems(inv) where !inv.warnings.contains(p) { inv.warnings.append(p) }
             return ExtractionResult(kind: .invoice, invoice: inv)
         default:
-            return ExtractionResult(kind: .tables, tables: TableExtractor.tables(lines))
+            let found = await documentTables(doc)
+            return ExtractionResult(kind: .tables, tables: found.isEmpty ? TableExtractor.tables(lines) : found)
         }
     }
 
@@ -121,5 +142,35 @@ public enum DataExtractor {
         r.method = "layout+apple-intelligence"
         r.warnings = layout.warnings
         return r
+    }
+
+    /// Tables as Apple's document reader sees them (drawn or not). On pages with a text layer, each
+    /// cell's words come from the PDF itself, so nothing is misread; scans use the reader's text.
+    static func documentTables(_ doc: PDFDocument, maxPages: Int = 50) async -> [ExtractedTable] {
+        var out: [ExtractedTable] = []
+        for i in 0..<min(doc.pageCount, maxPages) {
+            guard let page = doc.page(at: i), let read = try? await DocumentReader.read(page: page, index: i) else { continue }
+            let words = PageText.words(page: page, index: i)
+            let exact = words.count >= 5
+            for t in read.tables where t.rowCount >= 2 && t.columnCount >= 2 {
+                var table = t
+                if exact {
+                    for k in table.cells.indices {
+                        let r = table.cells[k].rect.insetBy(dx: -1, dy: -1)
+                        let inside = words.filter { r.contains(CGPoint(x: $0.rect.midX, y: $0.rect.midY)) }
+                            .sorted { (($0.rect.midY / 4).rounded(), $0.rect.minX) < (($1.rect.midY / 4).rounded(), $1.rect.minX) }
+                        if !inside.isEmpty { table.cells[k].text = inside.map(\.text).joined(separator: " ") }
+                    }
+                }
+                // Rows and columns that came out empty are dropped.
+                var rows = table.grid.map { $0.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } }
+                rows = rows.filter { $0.contains { !$0.isEmpty } }
+                let usedColumns = (0..<table.columnCount).filter { c in rows.contains { !$0[c].isEmpty } }
+                rows = rows.map { r in usedColumns.map { r[$0] } }
+                guard rows.count >= 2, usedColumns.count >= 2 else { continue }
+                out.append(ExtractedTable(page: i + 1, rows: rows))
+            }
+        }
+        return out
     }
 }

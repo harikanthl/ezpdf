@@ -25,9 +25,16 @@ struct GeneralSettings: View {
     @State private var preset = EzPDF.shared.defaultPreset
     @State private var format = EzPDF.shared.defaultFormat
     @State private var folder = EzPDF.shared.exportFolder
+    @AppStorage(EzPDF.fetchFontsKey) private var fetchFonts = true
 
     var body: some View {
         Form {
+            Section {
+                Toggle("Get a document's fonts for editing", isOn: $fetchFonts)
+            } footer: {
+                Text("So changed words match the rest of the page: open-licensed fonts come from the Google Fonts collection (only the font's name is sent), and Calibri and Cambria get their same-width open twins. Fonts the document carries in full are used as they are.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Picker("Page size for links", selection: $preset) {
                 ForEach(PagePreset.allCases) { Text($0.displayName).tag($0) }
             }
@@ -97,8 +104,19 @@ struct AgentSettings: View {
 
     private var token: String { LocalServer.token }
 
+    @AppStorage(AgentApproval.policyKey) private var approval = AgentApproval.Policy.ask.rawValue
+
     var body: some View {
         Form {
+            Section {
+                Picker("When an agent wants to change a document", selection: $approval) {
+                    Text("Ask me for changes that can't be undone easily, and before sending").tag(AgentApproval.Policy.ask.rawValue)
+                    Text("Let agents on this Mac change documents").tag(AgentApproval.Policy.allow.rawValue)
+                }
+            } footer: {
+                Text("Redacting, flattening, deleting, signing, editing text and sending to Kindle ask first. Requests from outside this Mac (through a relay) always ask before any change.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("This Mac") {
                 LabeledContent("MCP server") {
                     HStack(spacing: 6) {
@@ -281,16 +299,17 @@ struct HelpSettings: View {
         Topic(title: "Rearrange, split and shrink", symbol: "square.grid.2x2", steps: [
             "Switch to Pages in the toolbar. Click pages to select them; ⌘ click adds, ⇧ click selects a range.",
             "Drag pages to reorder. Use the buttons to rotate, duplicate, extract to a new document or delete.",
-            "The scissors menu splits a document, and Undo restores the version before your last change.",
+            "The scissors menu splits a document. ⌘Z undoes a change (up to 30 steps back) and ⇧⌘Z redoes it.",
             "In the ⋯ menu: Compress, Make Text Searchable (OCR for scans), and Add Page Numbers.",
         ], shortcut: "⌥⌘P switches between Read and Pages"),
         Topic(title: "Edit a PDF", symbol: "pencil.tip.crop.circle", steps: [
             "Open the pencil menu in the toolbar: Add Text, Sign, Add Image, Draw Box, White-out or Redact Area, then drag a box on the page.",
             "Anything you add stays movable: click it, drag it, drag the corner dot to resize, press Delete to remove it, double-click to change the words, font, size or color.",
-            "Select words and choose Change Selected Text to reword them in the same font. Use Redact for anything that must be gone for good.",
+            "Select words and choose Change Selected Text to reword them. The new words use the document's own font and size; longer text moves the rest of the line, and the paragraph, along. If it can't fit, nothing changes and ezpdf says why.",
+            "ezpdf gets a document's fonts for editing: from the document itself, or open fonts from the Google Fonts collection (Calibri and Cambria get same-width twins). Use Redact for anything that must be gone for good.",
             "Header, Footer & Page Numbers adds page numbers, dates, Bates numbers and your logo to every page.",
-            "Drop a picture onto the page to place it there.",
-        ], shortcut: "⌘Z-style undo: ⋯ menu › Undo Last Change"),
+            "Drop or paste a picture onto the page to place it there. Select something you placed and ⌘C, ⌘X, ⌘V copy, cut and paste it, on this page or another document.",
+        ], shortcut: "⌘Z undo  ·  ⇧⌘Z redo  ·  ⌘C ⌘X ⌘V copy, cut, paste"),
         Topic(title: "Mark & Talk", symbol: "pencil.and.scribble", steps: [
             "Click the scribble pen in the toolbar (⇧⌘M). The assistant opens and starts listening.",
             "Circle or underline the spot on the page while you say what to change, like “make this the 12th” or “put our logo here”.",
@@ -299,6 +318,8 @@ struct HelpSettings: View {
         Topic(title: "Templates", symbol: "doc.text.image", steps: [
             "File › New from Template (⇧⌘N) has 20 ready documents: invoices, quotes, letters, an NDA, timesheets, forms and more.",
             "Every blank is a real form field: click and type, or ask the assistant to fill it in.",
+            "Make your own: in Templates, drop a PDF, scan or photo of any paper form onto Make from a Form. Its lines, boxes, checkboxes and signature lines become fields, and it's kept under My Templates.",
+            "For an open document, pencil menu › Make Fillable finds the blanks; Save as Template keeps it for next time.",
             "Agreements and consent forms are starting points, not legal advice.",
         ], shortcut: "⇧⌘N"),
         Topic(title: "Logos and images", symbol: "wand.and.stars", steps: [
@@ -327,7 +348,14 @@ struct HelpSettings: View {
             "Claude Desktop, Cursor and others: copy the JSON from the Agents tab into the app's MCP settings.",
             "Grok, ChatGPT, claude.ai: click Make Reachable (needs TopRelay), then use the pairing code or the Grok key.",
             "Agents can read, convert, extract data and send to Kindle. Remote bots can only read until you allow editing.",
+            "Every change to a document is logged with who made it: ⋯ menu › History.",
+            "Before an agent redacts, signs, edits text, flattens, deletes or sends to Kindle, ezpdf asks you. Requests from outside this Mac always ask. Change this in the Agents tab.",
         ], settings: .agents),
+        Topic(title: "The assistant remembers", symbol: "brain", steps: [
+            "Tell the assistant lasting things, like “always sign as Hari L.” or “use DD/MM/YYYY dates”, and it keeps them for next time.",
+            "See, add or delete what it remembers in Settings › Assistant › Memory.",
+            "Quick decisions (optional, Settings › Assistant) make everyday requests instant: “compress it”, “undo that”, “make this fillable”.",
+        ], settings: .assistant),
         Topic(title: "Shortcuts, Spotlight and more", symbol: "bolt", steps: [
             "The Shortcuts app has ezpdf actions: Make PDF from Link, Make PDF from Files, Extract Statement or Invoice Data, Send Link to Kindle.",
             "Spotlight finds text inside every document in your library.",

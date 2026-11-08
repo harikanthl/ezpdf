@@ -11,6 +11,7 @@ import OperatorLLM
 
 struct AssistantSettings: View {
     @State private var settings = LLMProviderSettings.load()
+    @State private var reloading = false
     @State private var key = ""
     @State private var hasKey = false
     @State private var saveFailure: String?
@@ -72,12 +73,25 @@ struct AssistantSettings: View {
                 Text("The assistant edits your PDFs with the same tools AI agents use. With a cloud model, the text it reads from your document is sent to that provider. Keys stay in your Keychain.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            MemorySection()
+            QuickDecisionsSection()
             ImageKeysSection()
         }
         .formStyle(.grouped)
         .onAppear(perform: refreshKey)
-        .onChange(of: settings.preset) { settings.modelId = ""; refreshKey(); test = nil }
-        .onChange(of: settings) { settings.save() }
+        .onChange(of: settings.preset) {
+            // A model picked on the Models page arrives with its preset: keep that model.
+            if !reloading { settings.modelId = "" }
+            reloading = false
+            refreshKey(); test = nil
+        }
+        .onChange(of: settings) { if LLMProviderSettings.load() != settings { settings.save() } }
+        .onReceive(NotificationCenter.default.publisher(for: LLMProviderSettings.didChange)) { _ in
+            let saved = LLMProviderSettings.load()
+            guard saved != settings else { return }
+            reloading = saved.preset != settings.preset
+            settings = saved
+        }
     }
 
     private func refreshKey() {

@@ -34,14 +34,14 @@ public enum TemplateRenderer {
             let top = CGFloat(b.y - r.slices[i].lowerBound) + margin
             let rect = CGRect(x: margin + CGFloat(b.x), y: pageSize.height - top - CGFloat(b.h), width: CGFloat(b.w), height: CGFloat(b.h))
             let w = PDFAnnotation(bounds: rect.insetBy(dx: 0, dy: b.type == "checkbox" ? 0 : 1), forType: .widget, withProperties: nil)
+            // The field type first: setting it renames the field (text0, button0…), so the name comes after.
+            w.widgetFieldType = b.type == "checkbox" ? .button : .text
             w.fieldName = b.name
             if !b.label.isEmpty { w.setValue(b.label, forAnnotationKey: PDFAnnotationKey(rawValue: "/TU")) }
             if b.type == "checkbox" {
-                w.widgetFieldType = .button
                 w.widgetControlType = .checkBoxControl
                 w.buttonWidgetState = ["true", "yes", "on", "x"].contains(values[b.name]?.lowercased() ?? "") ? .onState : .offState
             } else {
-                w.widgetFieldType = .text
                 w.isMultiline = b.type == "multiline"
                 w.font = NSFont.systemFont(ofSize: b.type == "multiline" ? 9.5 : 10)
                 w.fontColor = .black

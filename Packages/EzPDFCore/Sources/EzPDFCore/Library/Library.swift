@@ -52,6 +52,9 @@ public final class Library: @unchecked Sendable {
     public init(root: URL? = nil) {
         if let root {
             self.root = root
+        } else if let custom = ProcessInfo.processInfo.environment["EZPDF_LIBRARY"], !custom.isEmpty {
+            // A separate library (tests, the CLI in development) so nothing lands in the real one.
+            self.root = URL(fileURLWithPath: (custom as NSString).expandingTildeInPath, isDirectory: true)
         } else {
             let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             self.root = support.appendingPathComponent("ezpdf/Library", isDirectory: true)
