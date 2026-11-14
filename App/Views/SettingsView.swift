@@ -153,15 +153,12 @@ struct AgentSettings: View {
                 Button("New Token…") {
                     LocalServer.rotateToken()
                     revealToken = true
-                    // TopRelay stored the old token as its upstream header; update it, or every relayed call fails.
-                    if relayURL != nil {
-                        relay {
-                            relayURL = try await TopRelay.connect(localURL: server.mcpURL, token: LocalServer.token)
-                            relayMessage = "TopRelay now uses the new token."
-                        }
-                    }
+                    // TopRelay reads the token file on every request, so relayed bots keep working. Connecting
+                    // again also moves a registration made by an older ezpdf (token copied into TopRelay) onto
+                    // the file, without revoking any bot's access.
+                    if relayURL != nil { reachable(startAtLogin: false) }
                 }
-                .help("Disconnects every agent using the old token")
+                .help("Disconnects local agents using the old token. Bots reaching ezpdf through TopRelay keep working.")
             }
 
             Section {
@@ -177,7 +174,7 @@ struct AgentSettings: View {
                         }
                     }
                     HStack {
-                        Button(relayURL == nil ? "Make Reachable" : "Reconnect") { relay { relayURL = try await TopRelay.connect(localURL: server.mcpURL, token: token); try? await TopRelay.startAtLogin() } }
+                        Button(relayURL == nil ? "Make Reachable" : "Reconnect") { reachable(startAtLogin: true) }
                         Button("Code for claude.ai / ChatGPT") { relay { let c = try await TopRelay.pairingCode(); output = "Pairing code: \(c)\nAdd \(relayURL ?? "the address") as a custom connector, then enter this code on the consent page."; copy(c) } }
                             .disabled(relayURL == nil)
                         Button("Key for Grok") { relay { let k = try await TopRelay.key(client: "xai"); output = k.snippet.isEmpty ? k.key : k.snippet; copy(output ?? "") } }
@@ -204,6 +201,21 @@ struct AgentSettings: View {
         }
         .formStyle(.grouped)
         .task { let s = await TopRelay.status(); relayURL = s.url; relayConnected = s.connected; relayMessage = s.error }
+    }
+
+    /// Registers ezpdf with TopRelay (or updates it in place) and says whether paired bots kept their access.
+    private func reachable(startAtLogin: Bool) {
+        relay {
+            _ = LocalServer.token // creates the token file on a first run, so TopRelay has something to read
+            let r = try await TopRelay.connect(localURL: server.mcpURL, tokenFile: LocalServer.tokenFile)
+            relayURL = r.url
+            switch r.outcome {
+            case .added: relayMessage = nil
+            case .kept: relayMessage = "Up to date. Paired bots and keys keep working."
+            case .readded: relayMessage = "ezpdf's local address changed, so TopRelay registered it again. Pair claude.ai and ChatGPT again and make new keys."
+            }
+            if startAtLogin { try? await TopRelay.startAtLogin() }
+        }
     }
 
     private func relay(_ body: @escaping () async throws -> Void) {

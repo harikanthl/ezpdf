@@ -65,14 +65,16 @@ claude mcp add --transport http ezpdf http://127.0.0.1:7337/mcp --header "Author
 ```
 
 **Grok, ChatGPT, claude.ai:** Settings → Agents → Make Reachable runs
-`toprelay add ezpdf --mcp-url … --header "X-EzPDF-Token: …" --tools-default allow-readonly`. TopRelay strips
-`Authorization`, so ezpdf also accepts `X-EzPDF-Token`. From that screen:
+`toprelay add ezpdf --mcp-url … --header-file X-EzPDF-Token=…/mcp-token --tools-default allow-readonly`. TopRelay
+strips `Authorization`, so ezpdf also accepts `X-EzPDF-Token`. TopRelay reads the token file on every request, so
+New Token… takes effect at once and bots stay connected. Reconnect updates the registration in place with
+`toprelay set-header`; it never removes the service, which would revoke every key and pairing. From that screen:
 
 - **Code for claude.ai / ChatGPT** creates a pairing code (`toprelay pair ezpdf`).
 - **Key for Grok** creates an xAI Responses API snippet (`toprelay key ezpdf --client xai`).
 - **Allow Editing Tools** exposes the write tools.
 
-TopRelay has no file channel, so the tools are built so that files rarely need to travel: `send_to_kindle` and
+ezpdf doesn't use TopRelay's file outbox (`--files-dir`) yet, so the tools are built so that files rarely need to travel: `send_to_kindle` and
 `export_file` finish the job on the Mac.
 
 **Security:**

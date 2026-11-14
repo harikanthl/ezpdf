@@ -58,15 +58,37 @@ enum TopRelay {
         return obj
     }
 
-    /// Registers ezpdf (or refreshes its token header). Read-only tools are exposed by default;
-    /// the rest can be allowed in Settings.
-    static func connect(localURL: String, token: String) async throws -> String? {
-        let list = try? await run(["list"])
-        let exists = (list?["services"] as? [[String: Any]])?.contains { $0["name"] as? String == service } ?? false
-        if exists { _ = try? await run(["remove", service]) }
-        let r = try await run(["add", service, "--mcp-url", localURL, "--header", "X-EzPDF-Token: \(token)",
+    /// What `connect` did, so Settings can say whether paired bots keep working.
+    enum Outcome {
+        /// Added for the first time.
+        case added
+        /// Already there: the token header now points at the token file. Keys, OAuth grants and tool choices are kept.
+        case kept
+        /// The local address changed (a different port), which TopRelay can only change by removing the service:
+        /// paired bots and keys must be set up again.
+        case readded
+    }
+
+    /// Registers ezpdf, or brings an existing registration up to date without disconnecting anyone.
+    ///
+    /// The token travels as `--header-file`: TopRelay reads the 0600 token file on every request, so the token
+    /// never appears in a process list and a new token takes effect without touching TopRelay. An existing
+    /// service is updated with `set-header` rather than removed, because `remove` revokes every key and OAuth
+    /// grant. Read-only tools are exposed by default; the rest can be allowed in Settings.
+    static func connect(localURL: String, tokenFile: URL) async throws -> (url: String?, outcome: Outcome) {
+        let header = "X-EzPDF-Token=\(tokenFile.path)"
+        // Before `toprelay login` there is no configuration and `list` fails; `add` then reports what to do.
+        // A failed list can't cause damage: `add` refuses a name that already exists.
+        let list = (try? await run(["list"])) ?? [:]
+        let existing = (list["services"] as? [[String: Any]])?.first { $0["name"] as? String == service }
+        if let existing, existing["local"] as? String == localURL {
+            try await run(["set-header", service, "--file", header])
+            return (existing["url"] as? String, .kept)
+        }
+        if existing != nil { try await run(["remove", service]) }
+        let r = try await run(["add", service, "--mcp-url", localURL, "--header-file", header,
                                "--tools-default", "allow-readonly"])
-        return r["url"] as? String
+        return (r["url"] as? String, existing == nil ? .added : .readded)
     }
 
     static func status() async -> (url: String?, connected: Bool, error: String?) {

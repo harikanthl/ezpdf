@@ -328,7 +328,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.2;
+				MARKETING_VERSION = 1.0.3;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.harikanth.ezpdf;
 				PRODUCT_NAME = ezpdf;
 				SDKROOT = macosx;
@@ -355,7 +355,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.0.2;
+				MARKETING_VERSION = 1.0.3;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.harikanth.ezpdf;
 				PRODUCT_NAME = ezpdf;
 				SDKROOT = macosx;
