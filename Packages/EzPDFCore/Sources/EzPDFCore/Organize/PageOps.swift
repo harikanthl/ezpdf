@@ -106,10 +106,11 @@ public enum PageOps {
         return doc.dataRepresentation(options: opts)
     }
 
-    /// Adds an invisible text layer to scanned pages so they can be searched and copied.
-    public static func makeSearchable(_ doc: PDFDocument) -> Data? {
-        let opts: [PDFDocumentWriteOption: Any] = [PDFDocumentWriteOption.saveTextFromOCROption: true]
-        return doc.dataRepresentation(options: opts)
+    /// Adds an invisible text layer to scanned pages (those in `pages`, or all) so they can be
+    /// searched and copied. Returns the saved document and how many pages got text.
+    public static func makeSearchable(_ doc: PDFDocument, pages: Set<Int>? = nil) async -> (data: Data?, pages: Int) {
+        let n = await TextLayer.addToScannedPages(doc, pages: pages)
+        return (doc.dataRepresentation(), n)
     }
 
     public static func protect(_ doc: PDFDocument, password: String, ownerPassword: String?, allowPrinting: Bool, allowCopying: Bool) -> Data? {

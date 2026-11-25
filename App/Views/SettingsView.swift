@@ -65,6 +65,7 @@ struct GeneralSettings: View {
 
 struct KindleSettings: View {
     @State private var s = KindleSender.Settings.load()
+    @State private var accounts: [String]?      // nil while asking Mail
 
     var body: some View {
         Form {
@@ -77,10 +78,13 @@ struct KindleSettings: View {
                     Text("Mail, automatically").tag(KindleSender.Method.mailAutomatic)
                     Text("Mail, as a draft I send").tag(KindleSender.Method.mailCompose)
                 }
+                if s.method == .mailAutomatic { senderRow }
                 Toggle("Send EPUB when there is one", isOn: $s.preferEPUB)
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Find your address on Amazon under Manage Your Content and Devices → Preferences → Personal Document Settings. Add the email address Mail sends from to the Approved Personal Document Email List there, or Amazon will drop the document.")
+                    Text(s.method == .mailAutomatic
+                         ? "Find your address on Amazon under Manage Your Content and Devices → Preferences → Personal Document Settings. The Send from address must be on the Approved Personal Document Email List there, or Amazon will drop the document."
+                         : "Find your address on Amazon under Manage Your Content and Devices → Preferences → Personal Document Settings. Check the draft's From address is on the Approved Personal Document Email List there, or Amazon will drop the document.")
                     Link("Open Amazon's settings", destination: URL(string: "https://www.amazon.com/hz/mycd/preferences/myx#/home/settings/payment")!)
                 }
                 .font(.caption).foregroundStyle(.secondary)
@@ -90,6 +94,31 @@ struct KindleSettings: View {
         .onChange(of: s.address) { s.save() }
         .onChange(of: s.method) { s.save() }
         .onChange(of: s.preferEPUB) { s.save() }
+        .onChange(of: s.sender) { s.save() }
+        .task(id: s.method) {
+            guard s.method == .mailAutomatic, accounts == nil else { return }
+            let found = await KindleSender.mailAccounts()
+            accounts = found
+            if s.sender.isEmpty, found.count == 1 { s.sender = found[0] }
+        }
+    }
+
+    @ViewBuilder private var senderRow: some View {
+        if let accounts, !accounts.isEmpty {
+            Picker("Send from", selection: $s.sender) {
+                if s.sender.isEmpty { Text("Choose an account").tag("") }
+                ForEach(accounts, id: \.self) { Text($0).tag($0) }
+                if !s.sender.isEmpty, !accounts.contains(where: { $0.caseInsensitiveCompare(s.sender) == .orderedSame }) {
+                    Text("\(s.sender) (not in Mail)").tag(s.sender)
+                }
+            }
+        } else if accounts == nil {
+            LabeledContent("Send from") { ProgressView().controlSize(.small) }
+        } else {
+            TextField("Send from", text: $s.sender, prompt: Text("you@example.com"))
+            Label("Couldn't read Mail's accounts. Type the address, or allow ezpdf to control Mail in System Settings → Privacy & Security → Automation.", systemImage: "exclamationmark.triangle")
+                .font(.caption).foregroundStyle(.orange)
+        }
     }
 }
 

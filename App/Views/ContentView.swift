@@ -34,6 +34,7 @@ struct ContentView: View {
         .animation(reduceMotion ? nil : Motion.out, value: app.toast)
         .sheet(item: $app.extractFor) { rec in ExtractSheet(record: rec) }
         .sheet(item: $app.renaming) { rec in RenameSheet(record: rec) }
+        .sheet(item: $app.kindleFor) { rec in KindleSendPanel(record: rec) { app.kindleFor = nil } }
         .sheet(isPresented: $app.showTemplates) { TemplatesView() }
         .onChange(of: app.settingsRequest) {
             guard let tab = app.settingsRequest else { return }

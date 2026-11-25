@@ -293,9 +293,10 @@ extension EzPDF {
             for (p, rects) in byPage { try EditOps.redact(doc, page: p, rects: rects) }
             // Make the rebuilt pages searchable again, off the main thread on a private copy.
             guard let raw = doc.dataRepresentation() else { throw EzPDFError.failed("Couldn't save the redaction.") }
+            let redactedPages = Set(byPage.keys)
             let ocr = await Task.detached(priority: .userInitiated) { () -> Data? in
                 guard let own = PDFDocument(data: raw) else { return nil }
-                return PageOps.makeSearchable(own)
+                return await PageOps.makeSearchable(own, pages: redactedPages).data
             }.value
             guard try record(rec.id, strict: true).modifiedAt == revision else { continue }
             let saved = try commitEditData(rec.id, ocr ?? raw)

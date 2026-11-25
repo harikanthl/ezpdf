@@ -351,8 +351,7 @@ struct ReaderView: View {
             .keyboardShortcut("j")
             Button { app.extractFor = record } label: { Image(systemName: "tablecells") }
                 .help("Extract transactions, invoice fields or tables")
-            Button { app.sendToKindle(record) } label: { Image(systemName: "paperplane") }
-                .help("Send to Kindle")
+            KindleSendButton(record: record)
             Menu {
                 Button("Summarize on This Mac") { summarize() }.disabled(!app.ops.canSummarize)
                 Button("Add Note to This Page…") { showNote = true }.disabled(mode != .read)
@@ -407,7 +406,8 @@ struct ReaderView: View {
                 switch action {
                 case .compress, .compress_strong:
                     app.show(r.after < r.before ? "Now \(ByteCountFormatter.string(fromByteCount: Int64(r.after), countStyle: .file)), was \(ByteCountFormatter.string(fromByteCount: Int64(r.before), countStyle: .file))" : "Already as small as this setting gets")
-                case .make_searchable: app.show("Text is now searchable")
+                case .make_searchable:
+                    app.show(r.record.modifiedAt == record.modifiedAt ? "Every page already has text" : "Text is now searchable")
                 default: app.show("Done")
                 }
             } catch { app.show(error.localizedDescription, error: true) }

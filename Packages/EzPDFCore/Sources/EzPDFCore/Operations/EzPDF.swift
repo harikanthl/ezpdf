@@ -570,10 +570,12 @@ public final class EzPDF {
             // OCR is slow, so it runs off the main thread on its own copy of the document
             // (PDFDocument isn't thread-safe; nothing else touches this one).
             let fileURL = url
-            out = await Task.detached(priority: .userInitiated) { () -> Data? in
-                guard let own = PDFDocument(url: fileURL) else { return nil }
-                return PageOps.makeSearchable(own)
+            let result = await Task.detached(priority: .userInitiated) { () -> (data: Data?, pages: Int) in
+                guard let own = PDFDocument(url: fileURL) else { return (nil, 0) }
+                return await PageOps.makeSearchable(own)
             }.value
+            if result.data != nil, result.pages == 0 { return (rec, before, before) }   // every page already has text
+            out = result.data
         case .protect:
             guard let password, !password.isEmpty else { throw EzPDFError.invalidInput("Give a password.") }
             let (_, doc) = try document(id)
@@ -728,6 +730,9 @@ public final class EzPDF {
         if useEPUB, !rec.hasEPUB { throw EzPDFError.invalidInput("“\(rec.title)” has no EPUB.") }
         let file = useEPUB ? library.epubURL(for: rec.id) : try deliverableFile(rec.id)
         try await KindleSender.send(file: file, title: rec.title, settings: settings)
+        var latest = KindleSender.Settings.load()   // reload: settings may have changed while Mail worked
+        latest.remember(settings.address)
+        latest.save()
         try library.update(rec.id) { $0.sentToKindleAt = Date() }
         return (try record(rec.id), useEPUB ? .epub : .pdf, settings.address)
     }

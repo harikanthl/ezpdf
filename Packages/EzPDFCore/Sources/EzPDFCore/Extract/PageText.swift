@@ -65,6 +65,7 @@ public enum PageText {
         var request = RecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
+        request.automaticallyDetectsLanguage = true     // not just English
         guard let observations = try? await request.perform(on: image) else { return [] }
         let w = size.width, h = size.height
         return observations.compactMap { obs in

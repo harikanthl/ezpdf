@@ -38,6 +38,8 @@ final class AppModel {
     var openPage: Int?
     var extractFor: DocumentRecord?
     var renaming: DocumentRecord?
+    /// The document whose Send to Kindle panel is open as a sheet (menu, shortcut, toast).
+    var kindleFor: DocumentRecord?
     /// Set to a tab to open Settings there (from ezpdf://settings links).
     var settingsRequest: String?
     /// The assistant beside the reader; it works on whichever document is open.
@@ -146,12 +148,16 @@ final class AppModel {
         }
     }
 
-    func sendToKindle(_ rec: DocumentRecord) {
-        show("Sending “\(rec.title)” to your Kindle…")
+    /// Asks where to send it (and from which account), then sends.
+    func sendToKindle(_ rec: DocumentRecord) { kindleFor = rec }
+
+    /// Sends with the saved settings, which the send panel has just updated.
+    func send(_ rec: DocumentRecord, toKindleAs format: EzPDF.ExportFormat?, to address: String) {
+        show("Sending “\(rec.title)” to \(address)…")
         Task {
             do {
-                let r = try await ops.sendToKindle(rec.id)
-                show("Sent to Kindle as \(r.format.rawValue.uppercased())")
+                let r = try await ops.sendToKindle(rec.id, format: format)
+                show("Sent to \(r.address) as \(r.format.rawValue.uppercased())")
             } catch {
                 show(error.localizedDescription, error: true)
             }
