@@ -119,9 +119,14 @@ struct PagesView: View {
                     Capsule().fill(Color.accentColor).frame(width: 3).offset(x: -10)
                 }
             }
+            // One line at its own size (a narrow cell mustn't wrap or cut "1024"), with room
+            // around the digits, and never narrower than round for a single digit.
             Text("\(i + 1)")
                 .font(.caption.monospacedDigit().weight(isSelected ? .semibold : .regular))
-                .padding(.horizontal, 7).padding(.vertical, 1)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .frame(minWidth: 20)
                 .background(Capsule().fill(isSelected ? Color.accentColor : .clear))
                 .foregroundStyle(isSelected ? .white : .secondary)
         }

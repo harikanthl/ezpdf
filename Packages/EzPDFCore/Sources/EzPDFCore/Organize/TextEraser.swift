@@ -444,6 +444,8 @@ enum TextEraser {
             case glyphs(Set<Int>)
             /// Remove nothing; record glyph boxes and opaque rectangle fills in drawing order.
             case survey
+            /// Remove nothing and skip text: only record where images are drawn (`imageDraws`).
+            case images
         }
         let mode: Mode
         /// Every glyph and every fill gets the next number, in the order they're drawn.
@@ -455,6 +457,8 @@ enum TextEraser {
         /// New content for form XObjects that lost glyphs, by stream.
         var formReplacements: [CGPDFStreamRef: [UInt8]] = [:]
         var formUses: [CGPDFStreamRef: Int] = [:]
+        /// Every image XObject drawn, with the CTM it was drawn under (page default user space).
+        var imageDraws: [(stream: CGPDFStreamRef, ctm: CGAffineTransform)] = []
         private var fonts: [CGPDFDictionaryRef: Font] = [:]
 
         init(mode: Mode) { self.mode = mode }
@@ -463,6 +467,8 @@ enum TextEraser {
             switch mode {
             case .survey:
                 glyphs.append((order, glyph))
+                return false
+            case .images:
                 return false
             case .glyphs(let set):
                 return set.contains(order)
@@ -653,6 +659,7 @@ enum TextEraser {
                     if let m = nums(6) { tlm = CGAffineTransform(a: m[0], b: m[1], c: m[2], d: m[3], tx: m[4], ty: m[5]); tm = tlm }
                 case "T*": moveLine(0, -g.text.leading)
                 case "Tj", "'", "\"", "TJ":
+                    if case .images = mode { break }
                     // Text in a font this can't measure: its glyphs can't be placed, so stop.
                     if g.text.unreadable { failed = true; return nil }
                     var prefix: [UInt8] = []
@@ -686,7 +693,13 @@ enum TextEraser {
                           CGPDFDictionaryGetStream(xobjects, name, &stream), let stream,
                           let dict = CGPDFStreamGetDictionary(stream) else { break }
                     var st: UnsafePointer<CChar>?
-                    guard CGPDFDictionaryGetName(dict, "Subtype", &st), let st, String(cString: st) == "Form" else { break }
+                    guard CGPDFDictionaryGetName(dict, "Subtype", &st), let st else { break }
+                    if String(cString: st) == "Image" {
+                        // An image fills the unit square mapped by the CTM.
+                        imageDraws.append((stream, g.ctm))
+                        break
+                    }
+                    guard String(cString: st) == "Form" else { break }
                     formUses[stream, default: 0] += 1
                     var matrix = CGAffineTransform.identity
                     var m: CGPDFArrayRef?
@@ -698,7 +711,10 @@ enum TextEraser {
                     var formResources: CGPDFDictionaryRef?
                     let res = CGPDFDictionaryGetDictionary(dict, "Resources", &formResources) ? formResources : resources
                     var format = CGPDFDataFormat.raw
-                    guard let data = CGPDFStreamCopyData(stream, &format) as Data?, format == .raw else { failed = true; return nil }
+                    guard let data = CGPDFStreamCopyData(stream, &format) as Data?, format == .raw else {
+                        if case .images = mode { break }    // keep looking at the rest of the page
+                        failed = true; return nil
+                    }
                     let before = removed
                     guard let rewritten = run([UInt8](data), resources: res, ctm: matrix.concatenating(g.ctm), depth: depth + 1) else { return nil }
                     if removed > before { formReplacements[stream] = rewritten }
@@ -755,12 +771,32 @@ enum TextEraser {
         private var next = 4
         private var streamIDs: [CGPDFStreamRef: Int] = [:]
         private var pending: [(Int, CGPDFStreamRef)] = []
+        private var dictIDs: [CGPDFDictionaryRef: Int] = [:]
+        private var pendingDicts: [(Int, CGPDFDictionaryRef)] = []
+        /// Every dictionary becomes its own object, written once however often it's referenced.
+        /// For copying whole documents: shared resources stay shared, and /Parent links (pages,
+        /// form fields, outline items) point back at the same object.
+        private let shareDictionaries: Bool
         private let replacements: [CGPDFStreamRef: [UInt8]]
+        private let images: [CGPDFStreamRef: ImageReplacement]
         private var path: Set<CGPDFDictionaryRef> = []
         var failed = false
 
-        init(replacements: [CGPDFStreamRef: [UInt8]]) {
+        /// A re-encoded image: its new data and the dictionary entries that change (Width, Height,
+        /// ColorSpace…; "" removes one). `jpeg` data is written as /DCTDecode; otherwise it's raw
+        /// samples, deflated.
+        struct ImageReplacement {
+            var data: Data
+            var entries: [String: String]
+            var jpeg: Bool
+        }
+
+        init(replacements: [CGPDFStreamRef: [UInt8]], images: [CGPDFStreamRef: ImageReplacement] = [:],
+             shareDictionaries: Bool = false) {
             self.replacements = replacements
+            self.images = images
+            self.shareDictionaries = shareDictionaries
+            if shareDictionaries { next = 1 }
             out.append(contentsOf: Array("%PDF-1.7\n%\u{E2}\u{E3}\u{CF}\u{D3}\n".utf8))
         }
 
@@ -819,6 +855,7 @@ enum TextEraser {
             case .dictionary:
                 var d: CGPDFDictionaryRef?
                 guard CGPDFObjectGetValue(o, .dictionary, &d), let d else { return "<<>>" }
+                if shareDictionaries { return reference(d) }
                 return value(dict: d, depth: depth + 1)
             case .stream:
                 guard let s = TextEraser.streamValue(o) else { return "null" }
@@ -844,9 +881,51 @@ enum TextEraser {
             return "<< " + parts.joined(separator: " ") + " >>"
         }
 
+        /// Left out of whole-document copies: the tagged structure tree (CGPDF can't follow its
+        /// references, and PDFKit drops it when saving anyway), editors' private data and page
+        /// thumbnails, which viewers make themselves.
+        static let droppedKeys: Set<String> = ["StructTreeRoot", "PieceInfo", "Thumb"]
+
+        /// The object number a shared dictionary is (or will be) written as.
+        func reference(_ d: CGPDFDictionaryRef) -> String {
+            if let id = dictIDs[d] { return "\(id) 0 R" }
+            let id = reserve()
+            dictIDs[d] = id
+            pendingDicts.append((id, d))
+            return "\(id) 0 R"
+        }
+
         private func writePendingStreams() {
+            while !pending.isEmpty || !pendingDicts.isEmpty {
+                while let (id, d) = pendingDicts.popLast() {
+                    var parts: [String] = []
+                    CGPDFDictionaryApplyBlock(d, { key, obj, _ in
+                        let k = String(cString: key)
+                        if !Writer.droppedKeys.contains(k) { parts.append(TextEraser.name(k) + " " + self.value(obj, depth: 1)) }
+                        return true
+                    }, nil)
+                    write(id, "<< " + parts.joined(separator: " ") + " >>")
+                }
+                writeOneStream()
+            }
+        }
+
+        private func writeOneStream() {
             while let (id, s) = pending.popLast() {
                 guard let d = CGPDFStreamGetDictionary(s) else { failed = true; continue }
+                if let image = images[s] {
+                    var entries: [String: String] = [:]
+                    CGPDFDictionaryApplyBlock(d, { key, obj, _ in
+                        let k = String(cString: key)
+                        if !["Length", "Filter", "DecodeParms", "Decode"].contains(k) { entries[k] = self.value(obj, depth: 1) }
+                        return true
+                    }, nil)
+                    entries.merge(image.entries) { $1 }
+                    entries = entries.filter { !$0.value.isEmpty }     // "" takes an entry out
+                    if image.jpeg { entries["Filter"] = "/DCTDecode" }
+                    writeStream(id, dict: entries, data: image.data, compress: !image.jpeg)
+                    continue
+                }
                 var format = CGPDFDataFormat.raw
                 let data: Data
                 if let replaced = replacements[s] { data = Data(replaced) }
@@ -874,6 +953,11 @@ enum TextEraser {
             }
         }
 
+        /// Root and trailer entries for whole-document copies (`setTrailer`).
+        private var root = "1 0 R"
+        private var trailerExtra = ""
+        func setTrailer(root: String, extra: String) { self.root = root; trailerExtra = extra.isEmpty ? "" : " " + extra }
+
         func finish() -> Data? {
             writePendingStreams()
             let count = next
@@ -883,7 +967,7 @@ enum TextEraser {
                 guard let at = offsets[id] else { return nil }
                 table += String(format: "%010d 00000 n \n", at)
             }
-            table += "trailer\n<< /Size \(count) /Root 1 0 R >>\nstartxref\n\(xref)\n%%EOF\n"
+            table += "trailer\n<< /Size \(count) /Root \(root)\(trailerExtra) >>\nstartxref\n\(xref)\n%%EOF\n"
             out.append(contentsOf: Array(table.utf8))
             return out
         }

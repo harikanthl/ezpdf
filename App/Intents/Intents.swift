@@ -1,6 +1,7 @@
 import AppIntents
 import EzPDFCore
 import UniformTypeIdentifiers
+import PDFKit
 
 /// Shortcuts / Spotlight / Siri actions. Same operations as the UI and the MCP server.
 
@@ -103,6 +104,85 @@ struct SendLinkToKindleIntent: AppIntent {
     }
 }
 
+enum ConvertFormatEntity: String, AppEnum {
+    case docx, md, txt, png, jpg
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Format"
+    static let caseDisplayRepresentations: [ConvertFormatEntity: DisplayRepresentation] = [
+        .docx: "Word", .md: "Markdown", .txt: "Plain Text", .png: "PNG Images", .jpg: "JPEG Images",
+    ]
+    var format: PDFConverter.Format { PDFConverter.Format(rawValue: rawValue) ?? .docx }
+}
+
+enum CompressionEntity: String, AppEnum {
+    case balanced, small, smallest
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Compression"
+    static let caseDisplayRepresentations: [CompressionEntity: DisplayRepresentation] = [
+        .balanced: "Print Quality", .small: "Screen Quality", .smallest: "Smallest",
+    ]
+    var settings: ImageCompressor.Settings {
+        switch self {
+        case .balanced: return .balanced
+        case .small: return .small
+        case .smallest: return .smallest
+        }
+    }
+}
+
+struct ConvertPDFIntent: AppIntent {
+    static let title: LocalizedStringResource = "Convert PDF"
+    static let description = IntentDescription("Turns a PDF into a Word document, Markdown, plain text, or an image of each page, on this Mac.")
+
+    @Parameter(title: "PDF", supportedContentTypes: [.pdf]) var file: IntentFile
+    @Parameter(title: "Format", default: .docx) var format: ConvertFormatEntity
+    @Parameter(title: "Pages", description: "Like 1-3,5. Leave empty for all.") var pages: String?
+    @Parameter(title: "Resolution (ppi)", description: "For images.", default: 150, inclusiveRange: (36, 600)) var dpi: Int
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Convert \(\.$file) to \(\.$format)") { \.$pages; \.$dpi }
+    }
+
+    func perform() async throws -> some IntentResult & ReturnsValue<[IntentFile]> {
+        let title = ((file.filename as NSString).lastPathComponent as NSString).deletingPathExtension
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ezpdf-out-\(UUID().uuidString)")
+        var results: [IntentFile] = []
+        // Written as they're made, so many page images don't all sit in memory.
+        _ = try await PDFConverter.convert(file.data, title: title.isEmpty ? "Document" : title, format: format.format,
+                                           options: .init(pages: pages, dpi: dpi)) { f in
+            let u = dir.appendingPathComponent(f.path)
+            try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try f.data.write(to: u)
+            results.append(IntentFile(fileURL: u, filename: u.lastPathComponent, type: UTType(filenameExtension: u.pathExtension) ?? .data))
+        }
+        return .result(value: results)
+    }
+}
+
+struct CompressPDFIntent: AppIntent {
+    static let title: LocalizedStringResource = "Compress PDF"
+    static let description = IntentDescription("Makes a PDF smaller by resizing and re-encoding its images. Text, links and form fields are kept.")
+
+    @Parameter(title: "PDF", supportedContentTypes: [.pdf]) var file: IntentFile
+    @Parameter(title: "Compression", default: .small) var level: CompressionEntity
+
+    static var parameterSummary: some ParameterSummary { Summary("Compress \(\.$file) to \(\.$level)") }
+
+    func perform() async throws -> some IntentResult & ReturnsValue<IntentFile> {
+        let input = file.data
+        let settings = level.settings
+        let smaller = await Task.detached(priority: .userInitiated) { () -> Data? in
+            guard let doc = PDFDocument(data: input), !doc.isLocked else { return nil }
+            return ImageCompressor.compress(doc, settings: settings)?.data
+        }.value
+        let name = (file.filename as NSString).lastPathComponent
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ezpdf-out-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let out = dir.appendingPathComponent(name.isEmpty || name.hasPrefix(".") ? "Document.pdf" : name)
+        // Already as small as this setting gets: the original comes back unchanged.
+        try (smaller.flatMap { $0.count < input.count ? $0 : nil } ?? input).write(to: out)
+        return .result(value: IntentFile(fileURL: out, filename: out.lastPathComponent, type: .pdf))
+    }
+}
+
 /// Files handed to Shortcuts are copies, so later actions can't change the library's own file.
 enum IntentOutput {
     @MainActor
@@ -128,5 +208,9 @@ struct EzPDFShortcuts: AppShortcutsProvider {
                     shortTitle: "Extract Data", systemImageName: "tablecells")
         AppShortcut(intent: MakePDFFromFilesIntent(), phrases: ["Combine files with \(.applicationName)"],
                     shortTitle: "Make PDF from Files", systemImageName: "square.stack")
+        AppShortcut(intent: ConvertPDFIntent(), phrases: ["Convert a PDF with \(.applicationName)"],
+                    shortTitle: "Convert PDF", systemImageName: "doc.text")
+        AppShortcut(intent: CompressPDFIntent(), phrases: ["Compress a PDF with \(.applicationName)"],
+                    shortTitle: "Compress PDF", systemImageName: "arrow.down.right.and.arrow.up.left")
     }
 }

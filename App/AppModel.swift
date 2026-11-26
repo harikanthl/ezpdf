@@ -171,6 +171,29 @@ final class AppModel {
         } catch { show(error.localizedDescription, error: true) }
     }
 
+    /// Saves a converted copy (Word, Markdown, text, page images) to the export folder and shows it.
+    func saveAs(_ rec: DocumentRecord, _ format: PDFConverter.Format, pages: String? = nil, dpi: Int? = nil) {
+        // Progress only when there's a wait to explain: a quick export goes straight to its result
+        // instead of flashing one toast and replacing it.
+        let progress = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            if !Task.isCancelled { show("Exporting “\(rec.title)” as \(format.label)…") }
+        }
+        Task {
+            defer { progress.cancel() }
+            do {
+                let r = try await ops.exportConverted(rec.id, format: format, pages: pages, dpi: dpi)
+                progress.cancel()
+                NSWorkspace.shared.activateFileViewerSelecting([r.url])
+                let what = format.isImage && r.files > 1 ? "\(r.files) page images" : r.url.lastPathComponent
+                let note = r.notes.first.map { ". " + $0.prefix(1).uppercased() + $0.dropFirst() } ?? ""
+                show("Saved \(what) to \(r.url.deletingLastPathComponent().lastPathComponent)\(note)")
+            } catch {
+                show(error.localizedDescription, error: true)
+            }
+        }
+    }
+
     func revealInLibrary(_ rec: DocumentRecord) {
         NSWorkspace.shared.activateFileViewerSelecting([ops.library.pdfURL(for: rec.id)])
     }

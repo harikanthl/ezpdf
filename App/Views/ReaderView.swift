@@ -292,13 +292,24 @@ struct ReaderView: View {
         }
         ToolbarItemGroup {
             if mode == .read {
-                HStack(spacing: 2) {
+                HStack(spacing: 4) {
                     TextField("", text: $pageField)
-                        .frame(width: 38)
-                        .multilineTextAlignment(.trailing)
+                        .font(.callout.monospacedDigit())
+                        .frame(width: pageFieldWidth)
+                        .multilineTextAlignment(.center)
                         .textFieldStyle(.roundedBorder)
-                        .onSubmit { if let n = Int(pageField) { reader.goTo(pageNumber: n) } }
-                    Text("/ \(reader.pageCount)").font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        .onChange(of: pageField) { _, new in
+                            // Digits only, and no more of them than the last page has.
+                            let digits = String(new.filter(\.isNumber).prefix(String(max(reader.pageCount, 1)).count))
+                            if digits != new { pageField = digits }
+                        }
+                        .onSubmit {
+                            if let n = Int(pageField), n >= 1 { reader.goTo(pageNumber: min(n, max(reader.pageCount, 1))) }
+                            pageField = "\(reader.currentPageIndex + 1)"
+                        }
+                    Text("/ \(reader.pageCount)")
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        .lineLimit(1).fixedSize()
                 }
                 .help("Page")
                 Menu {
@@ -359,9 +370,14 @@ struct ReaderView: View {
                 Divider()
                 Button("Save PDF to Downloads") { app.export(record, as: .pdf) }
                 if record.hasEPUB { Button("Save EPUB to Downloads") { app.export(record, as: .epub) } }
+                ExportAsMenu(doc: record, app: app)
+                Button("Export This Page as Image") { app.saveAs(record, .png, pages: "\(reader.currentPageIndex + 1)", dpi: 200) }
                 Divider()
-                Button("Compress") { optimize(.compress) }
-                Button("Compress More (lower image quality)") { optimize(.compress_strong) }
+                Menu("Compress") {
+                    Button("Print Quality") { optimize(.compress, compression: .balanced) }
+                    Button("Screen Quality") { optimize(.compress_strong, compression: .small) }
+                    Button("Smallest, for Email") { optimize(.compress_strong, compression: .smallest) }
+                }
                 Button("Make Text Searchable (OCR)") { optimize(.make_searchable) }
                 Button("Add Page Numbers") { optimize(.page_numbers) }
                 Divider()
@@ -378,6 +394,14 @@ struct ReaderView: View {
     }
 
     enum SideChoice: Hashable { case none, outline, thumbnails }
+
+    /// Wide enough for the last page's number in the field's own digits, plus the field's inset.
+    private var pageFieldWidth: CGFloat {
+        let digits = max(2, String(max(reader.pageCount, 1)).count)
+        let size = NSFont.preferredFont(forTextStyle: .callout).pointSize
+        let zero = ("0" as NSString).size(withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: .regular)]).width
+        return ceil(zero * CGFloat(digits)) + 16
+    }
 
     private var notePopover: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -396,16 +420,18 @@ struct ReaderView: View {
         .padding(14)
     }
 
-    private func optimize(_ action: EzPDF.Optimization) {
+    private func optimize(_ action: EzPDF.Optimization, compression: ImageCompressor.Settings? = nil) {
         reader.flushAnnotations()
-        withAnimation(reduceMotion ? nil : Motion.out) { busy = action == .make_searchable ? "Reading scanned pages…" : "Working…" }
+        withAnimation(reduceMotion ? nil : Motion.out) { busy = action == .make_searchable ? "Reading scanned pages…" : action == .compress || action == .compress_strong ? "Compressing images…" : "Working…" }
         Task {
             defer { withAnimation(reduceMotion ? nil : Motion.outFast) { busy = nil } }
             do {
-                let r = try await app.ops.optimize(record.id, action)
+                let r = try await app.ops.optimize(record.id, action, compression: compression)
                 switch action {
                 case .compress, .compress_strong:
-                    app.show(r.after < r.before ? "Now \(ByteCountFormatter.string(fromByteCount: Int64(r.after), countStyle: .file)), was \(ByteCountFormatter.string(fromByteCount: Int64(r.before), countStyle: .file))" : "Already as small as this setting gets")
+                    app.show(r.after < r.before
+                             ? "\(ByteCountFormatter.string(fromByteCount: Int64(r.after), countStyle: .file)), \(Int((1 - Double(r.after) / Double(max(r.before, 1))) * 100))% smaller (was \(ByteCountFormatter.string(fromByteCount: Int64(r.before), countStyle: .file)))"
+                             : "Already as small as this setting gets")
                 case .make_searchable:
                     app.show(r.record.modifiedAt == record.modifiedAt ? "Every page already has text" : "Text is now searchable")
                 default: app.show("Done")

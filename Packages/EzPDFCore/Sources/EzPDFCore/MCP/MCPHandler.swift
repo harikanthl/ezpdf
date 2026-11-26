@@ -150,6 +150,7 @@ enum S {
         return s
     }
     static func int(_ d: String) -> [String: Any] { ["type": "integer", "description": d] }
+    static func number(_ d: String) -> [String: Any] { ["type": "number", "description": d] }
     static func bool(_ d: String) -> [String: Any] { ["type": "boolean", "description": d] }
     static func strings(_ d: String) -> [String: Any] { ["type": "array", "items": ["type": "string"], "description": d] }
     static func ints(_ d: String) -> [String: Any] { ["type": "array", "items": ["type": "integer"], "description": d] }
@@ -160,6 +161,12 @@ extension Dictionary where Key == String, Value == Any {
         if let s = self[k] as? String { let t = s.trimmingCharacters(in: .whitespaces); return t.isEmpty ? nil : t }
         if let n = self[k] as? NSNumber { return n.stringValue }
         return nil
+    }
+    /// A finite number (or numeric string), clamped to `range`.
+    func double(_ k: String, in range: ClosedRange<Double>) -> Double? {
+        let raw = (self[k] as? NSNumber)?.doubleValue ?? (self[k] as? String).flatMap { Double($0) }
+        guard let raw, raw.isFinite else { return nil }
+        return Swift.min(Swift.max(raw, range.lowerBound), range.upperBound)
     }
     /// Integers from callers are untrusted: clamp to a sane range so they can't overflow or
     /// make `prefix(-1)` trap.

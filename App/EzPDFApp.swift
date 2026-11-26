@@ -52,6 +52,7 @@ struct AppCommands: Commands {
             Divider()
             Button("Save PDF to Downloads") { if let d = app.selectedDocument { app.export(d, as: .pdf) } }
                 .keyboardShortcut("s", modifiers: [.command, .shift]).disabled(app.selectedDocument == nil)
+            if let d = app.selectedDocument { ExportAsMenu(doc: d, app: app) } else { Menu("Export As") {}.disabled(true) }
             Button("Merge All Visible…") { mergeVisible() }.disabled(app.visibleDocuments.count < 2)
         }
     }

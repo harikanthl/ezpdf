@@ -342,7 +342,14 @@ struct HelpSettings: View {
             "Drag pages to reorder. Use the buttons to rotate, duplicate, extract to a new document or delete.",
             "The scissors menu splits a document. ⌘Z undoes a change (up to 30 steps back) and ⇧⌘Z redoes it.",
             "In the ⋯ menu: Compress, Make Text Searchable (OCR for scans), and Add Page Numbers.",
+            "Compress resizes each picture for how big it is on the page: Print Quality keeps it sharp on paper, Screen Quality is much smaller, Smallest is for email. Text, links and form fields stay as they are. ⌘Z undoes it.",
         ], shortcut: "⌥⌘P switches between Read and Pages"),
+        Topic(title: "Export to Word, Markdown, text or images", symbol: "square.and.arrow.down.on.square", steps: [
+            "In the ⋯ menu, or Document › Export As, choose Word, Markdown, Plain Text or page images (PNG or JPEG).",
+            "Word and Markdown keep headings, paragraphs, bold and italic, lists, tables and pictures. Running headers and page numbers are left out.",
+            "Page images come in a folder, one picture per page. “Export This Page as Image” saves just the page you're on.",
+            "Scanned pages are read on this Mac with OCR. Files go to your export folder (Downloads unless you changed it).",
+        ]),
         Topic(title: "Edit a PDF", symbol: "pencil.tip.crop.circle", steps: [
             "Open the pencil menu in the toolbar: Add Text, Sign, Add Image, Draw Box, White-out or Redact Area, then drag a box on the page.",
             "Anything you add stays movable: click it, drag it, drag the corner dot to resize, press Delete to remove it, double-click to change the words, font, size or color.",

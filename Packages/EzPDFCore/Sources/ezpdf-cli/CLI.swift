@@ -184,6 +184,32 @@ enum CLI {
                 for l in await PageText.lines(doc) {
                     print(String(format: "p%d y%5.1f h%4.1f | ", l.page, l.y, l.height) + l.cells.map { "[\($0.text) @\(Int($0.rect.minX))-\(Int($0.rect.maxX))]" }.joined(separator: " "))
                 }
+            case "compress":
+                // compress <in.pdf> <out.pdf> [dpi] [quality]
+                guard args.count >= 3, let doc = PDFDocument(url: URL(fileURLWithPath: args[1])) else { usage(); return 2 }
+                let before = (try? Data(contentsOf: URL(fileURLWithPath: args[1])).count) ?? 0
+                let settings = ImageCompressor.Settings(maxDPI: args.count > 3 ? Double(args[3]) ?? 150 : 150,
+                                                        quality: args.count > 4 ? Double(args[4]) ?? 0.7 : 0.7)
+                let t0 = Date()
+                guard let r = ImageCompressor.compress(doc, settings: settings) else { print("nothing to compress"); return 1 }
+                try r.data.write(to: URL(fileURLWithPath: args[2]))
+                print("images: \(r.images) bytes: \(before) → \(r.data.count) secs: \(String(format: "%.1f", Date().timeIntervalSince(t0)))")
+            case "convert":
+                // convert <in.pdf> <format: docx|md|txt|png|jpg> <out folder> [pages] [dpi]
+                guard args.count >= 4, let format = PDFConverter.Format(rawValue: args[2]) else { usage(); return 2 }
+                let t0 = Date()
+                let out = try await PDFConverter.convert(try Data(contentsOf: URL(fileURLWithPath: args[1])),
+                                                         title: URL(fileURLWithPath: args[1]).deletingPathExtension().lastPathComponent,
+                                                         format: format,
+                                                         options: .init(pages: args.count > 4 ? args[4] : nil, dpi: args.count > 5 ? Int(args[5]) : nil))
+                let dir = URL(fileURLWithPath: args[3])
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for f in out.files {
+                    let u = dir.appendingPathComponent(f.path)
+                    try FileManager.default.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try f.data.write(to: u)
+                }
+                print("files: \(out.files.count) main: \(out.files.first?.path ?? "-") notes: \(out.notes) secs: \(String(format: "%.1f", Date().timeIntervalSince(t0)))")
             case "serve":
                 let port = args.count > 1 ? UInt16(args[1]) ?? LocalServer.defaultPort : LocalServer.defaultPort
                 LocalServer.shared.start(port: port)
@@ -206,6 +232,8 @@ enum CLI {
           ezpdf-cli web <url> <out.pdf> [preset]       link → PDF (+ EPUB next to it)
           ezpdf-cli file <in...> <out.pdf>             files → PDF
           ezpdf-cli extract <in.pdf> [auto|statement|invoice|tables] [noai]
+          ezpdf-cli compress <in.pdf> <out.pdf> [dpi] [quality]
+          ezpdf-cli convert <in.pdf> <docx|md|txt|png|jpg> <out folder> [pages] [dpi]
           ezpdf-cli serve [port]                       run the MCP + extension server
 
         """, stderr)

@@ -555,7 +555,10 @@ public final class EzPDF {
         case compress, compress_strong, make_searchable, protect, unlock, page_numbers, watermark
     }
 
-    public func optimize(_ id: String, _ action: Optimization, password: String? = nil, text: String? = nil) async throws -> (record: DocumentRecord, before: Int, after: Int) {
+    /// `compression` overrides the image resolution and quality for compress / compress_strong
+    /// (which default to `ImageCompressor.Settings.balanced` and `.small`).
+    public func optimize(_ id: String, _ action: Optimization, password: String? = nil, text: String? = nil,
+                         compression: ImageCompressor.Settings? = nil) async throws -> (record: DocumentRecord, before: Int, after: Int) {
         let rec = try record(id, strict: true)
         let before = rec.byteCount
         let url = library.pdfURL(for: rec.id)
@@ -563,9 +566,22 @@ public final class EzPDF {
         let out: Data?
         switch action {
         case .compress, .compress_strong:
-            let (_, doc) = try document(rec.id)
-            out = PageOps.compress(doc, level: action == .compress ? .light : .strong)
-            if let o = out, o.count >= before { return (rec, before, before) }    // never make it bigger
+            // Images are re-encoded for the size they're drawn at, off the main thread on its own
+            // copy of the document. PDFKit's own JPEG pass is the fallback (encrypted files, or no
+            // image it can change); whichever is smaller wins, and never bigger than before.
+            _ = try document(rec.id)        // says so if it's locked, instead of "already small"
+            let settings = compression ?? (action == .compress ? .balanced : .small)
+            let fileURL = url
+            let level: PageOps.CompressLevel = action == .compress ? .light : .strong
+            let candidates = await Task.detached(priority: .userInitiated) { () -> [Data] in
+                var found: [Data] = []
+                if let own = PDFDocument(url: fileURL), let r = ImageCompressor.compress(own, settings: settings) { found.append(r.data) }
+                if found.isEmpty, let own = PDFDocument(url: fileURL), let d = PageOps.compress(own, level: level) { found.append(d) }
+                return found
+            }.value
+            out = candidates.min { $0.count < $1.count }
+            // Never bigger, and not a new version for a few bytes: at least 2% smaller.
+            if out == nil || Double(out!.count) > Double(before) * 0.98 { return (rec, before, before) }
         case .make_searchable:
             // OCR is slow, so it runs off the main thread on its own copy of the document
             // (PDFDocument isn't thread-safe; nothing else touches this one).
@@ -689,6 +705,92 @@ public final class EzPDF {
     // MARK: Export & send
 
     public enum ExportFormat: String, Codable, Sendable { case pdf, epub }
+
+    /// Names (folder path + "/" + name) that running conversions are about to write.
+    @ObservationIgnored private var reservedExportNames = Set<String>()
+
+    /// Saves the document as Word, Markdown, plain text or page images in the export folder.
+    /// Returns the main file (for several page images, their folder), how many files were written,
+    /// and notes worth passing on (pages read with OCR…).
+    public func exportConverted(_ id: String, format: PDFConverter.Format, pages: String? = nil, dpi: Int? = nil,
+                                quality: Double? = nil, folder: URL? = nil, source: JobSource = .app) async throws -> (url: URL, files: Int, notes: [String]) {
+        let rec = try record(id)
+        let dir = folder ?? exportFolder
+        guard FileAccess.isInside(dir, exportFolder) else {
+            throw EzPDFError.invalidInput("ezpdf saves only into your export folder (\(exportFolder.lastPathComponent)).")
+        }
+        let pdf = try deliverableData(rec.id)
+        // A name nothing in the folder uses yet (the file, and its images folder).
+        let base = safeName(rec.title)
+        var name = base
+        var n = 2
+        let fm = FileManager.default
+        let existing = Set((try? fm.contentsOfDirectory(atPath: dir.path)) ?? [])
+        // The names this format writes: the file; Markdown's figures and several page images go
+        // in "<name> images"; one page image is "<name> page N". Names an export still running has
+        // picked count as taken too, so two at once don't write over each other.
+        func claims(_ c: String) -> [String] {
+            switch format {
+            case .docx, .txt: return ["\(c).\(format.rawValue)"]
+            case .md: return ["\(c).md", "\(c) images"]
+            case .png, .jpg: return ["\(c).\(format.rawValue)", "\(c) images", "\(c) page *.\(format.rawValue)"]
+            }
+        }
+        func taken(_ c: String) -> Bool {
+            if claims(c).contains(where: { reservedExportNames.contains(dir.path + "/" + $0) }) { return true }
+            if existing.contains("\(c).\(format.rawValue)") { return true }
+            switch format {
+            case .docx, .txt: return false
+            case .md: return existing.contains("\(c) images")
+            case .png, .jpg:
+                return existing.contains("\(c) images")
+                    || existing.contains { $0.hasPrefix("\(c) page ") && $0.hasSuffix(".\(format.rawValue)") }
+            }
+        }
+        while taken(name) { name = "\(base) \(n)"; n += 1 }
+        let reserved = claims(name).map { dir.path + "/" + $0 }
+        reservedExportNames.formUnion(reserved)
+        defer { reservedExportNames.subtract(reserved) }
+        let options = PDFConverter.Options(pages: pages, dpi: dpi, quality: quality)
+        return try await run("Saving \(rec.title) as \(format.label)", source: source) { job in
+            job.documentID = rec.id
+            job.detail = "Reading the pages"
+            let title = name
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            // Files are written as they're made (page images never all sit in memory); if it
+            // fails partway, what was written is taken away again.
+            let (urls, notes) = try await Task.detached(priority: .userInitiated) { () -> ([URL], [String]) in
+                let fm = FileManager.default
+                var urls: [URL] = []
+                var folders: [URL] = []
+                do {
+                    let notes = try await PDFConverter.convert(pdf, title: title, format: format, options: options, progress: { detail in
+                        Task { @MainActor in job.detail = detail }
+                    }) { f in
+                        let u = dir.appendingPathComponent(f.path)
+                        guard FileAccess.isInside(u, dir) else { return }
+                        let parent = u.deletingLastPathComponent()
+                        if !fm.fileExists(atPath: parent.path) {
+                            try fm.createDirectory(at: parent, withIntermediateDirectories: true)
+                            folders.append(parent)
+                        }
+                        try f.data.write(to: u, options: .atomic)
+                        urls.append(u)
+                    }
+                    return (urls, notes)
+                } catch {
+                    for u in urls { try? fm.removeItem(at: u) }
+                    for f in folders where (try? fm.contentsOfDirectory(atPath: f.path))?.isEmpty == true { try? fm.removeItem(at: f) }
+                    throw error
+                }
+            }.value
+            guard let main = urls.first else { throw EzPDFError.failed("Nothing was written.") }
+            job.notes = notes
+            // Several page images: their folder is the result.
+            let result = format.isImage && urls.count > 1 ? main.deletingLastPathComponent() : main
+            return (result, urls.count, notes)
+        }
+    }
 
     public func export(_ id: String, format: ExportFormat = .pdf, folder: URL? = nil) throws -> URL {
         let rec = try record(id)

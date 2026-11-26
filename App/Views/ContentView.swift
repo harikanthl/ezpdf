@@ -285,11 +285,31 @@ struct DocumentMenu: View {
         Divider()
         Button("Save PDF to Downloads") { app.export(doc, as: .pdf) }
         if doc.hasEPUB { Button("Save EPUB to Downloads") { app.export(doc, as: .epub) } }
+        ExportAsMenu(doc: doc, app: app)
         Button("Show in Finder") { app.revealInLibrary(doc) }
         if let s = doc.sourceURL, let u = URL(string: s) { Button("Open Original Page") { NSWorkspace.shared.open(u) } }
         Divider()
         Button("Rename…") { app.renaming = doc }
         Button("Move to Trash", role: .destructive) { app.delete(doc) }
+    }
+}
+
+/// PDF → other formats. One menu, so the library, reader and Document menu offer the same choices.
+struct ExportAsMenu: View {
+    let doc: DocumentRecord
+    /// Passed in, not read from the environment: the menu bar's commands don't carry it.
+    let app: AppModel
+
+    var body: some View {
+        Menu("Export As") {
+            Button("Word Document") { app.saveAs(doc, .docx) }
+            Button("Markdown") { app.saveAs(doc, .md) }
+            Button("Plain Text") { app.saveAs(doc, .txt) }
+            Divider()
+            Button("Page Images (PNG)") { app.saveAs(doc, .png) }
+            Button("Page Images (JPEG)") { app.saveAs(doc, .jpg) }
+            Button("High-Resolution Page Images (PNG)") { app.saveAs(doc, .png, dpi: 300) }
+        }
     }
 }
 

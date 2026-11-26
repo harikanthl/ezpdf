@@ -12,8 +12,12 @@ feature is also an MCP tool, so Claude, Grok, ChatGPT and your own agents can dr
 - **Reader** (built on MuseDrop's reader): outline, thumbnails, search, Default/Sepia/Night themes, read aloud,
   two-up view, highlights, notes, and it reopens where you left off.
 - **Pages:** drag to reorder, rotate, delete, duplicate, extract, split, merge, insert a blank page, undo.
-- **Improve:** compress, OCR scanned pages so they become searchable, password-protect or unlock, page numbers,
-  watermark.
+- **Improve:** compress (each image re-encoded for the size it's drawn at — print, screen or email quality — while
+  text, fonts, links, form fields and the outline are copied as they are), OCR scanned pages so they become
+  searchable, password-protect or unlock, page numbers, watermark.
+- **PDF → Word, Markdown, text, images.** Headings, paragraphs with bold and italic, lists, tables (found with
+  Apple's document reader, filled with the PDF's own text) and figures; running headers and page numbers are left
+  out; scanned pages are read with OCR. Page images as PNG or JPEG at any resolution.
 - **Data:** bank and credit-card statements become transactions, checked row by row against the running balance.
   Invoices and receipts become vendor, number, dates, totals and line items. Anything else becomes tables. Export to
   Excel or CSV. Runs on the Mac: layout rules, with Vision OCR for scanned pages and Apple Intelligence

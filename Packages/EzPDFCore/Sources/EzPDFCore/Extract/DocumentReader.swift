@@ -53,6 +53,12 @@ public enum DocumentReader {
     public static func read(page: PDFPage, index: Int, scale: CGFloat = 2.5) async throws -> Page {
         let size = EditOps.PageSpace(page).size
         guard let image = PDFRaster.cgImage(page, scale: scale) else { throw EzPDFError.failed("Couldn't render page \(index + 1).") }
+        return try await read(image: image, size: size, index: index)
+    }
+
+    /// Reads a page already rendered (`size` is the page as shown, in points). Safe to run several
+    /// at once: it doesn't touch the PDF.
+    static func read(image: CGImage, size: CGSize, index: Int) async throws -> Page {
         var request = RecognizeDocumentsRequest()
         request.textRecognitionOptions.useLanguageCorrection = false
         request.barcodeDetectionOptions.enabled = false

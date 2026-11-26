@@ -163,12 +163,14 @@ enum MCPTools {
             },
 
             MCPTool(name: "improve_pdf", title: "Compress, OCR, protect…",
-                    description: "Whole-document changes: compress (smaller), compress_strong (much smaller, lower image quality), make_searchable (OCR scanned pages), protect (add a password), unlock (remove it), page_numbers, watermark, flatten (burn annotations and form values into the pages).",
+                    description: "Whole-document changes: compress (smaller; images kept at print quality, 220 ppi), compress_strong (much smaller; screen quality, 120 ppi), make_searchable (OCR scanned pages), protect (add a password), unlock (remove it), page_numbers, watermark, flatten (burn annotations and form values into the pages). Compression re-encodes images for the size they're drawn at; text, fonts, links, form fields and the outline are kept. dpi and quality set it exactly (e.g. dpi 72, quality 0.4 for the smallest email attachment).",
                     schema: S.object([
                         "id": S.string("Document id or title"),
                         "action": S.string("What to do", enum: EzPDF.Optimization.allCases.map(\.rawValue) + ["flatten"]),
                         "password": S.string("protect / unlock: the password"),
                         "text": S.string("watermark: the text"),
+                        "dpi": S.int("compress: highest image resolution kept, pixels per inch as drawn (36–1200)"),
+                        "quality": S.number("compress: JPEG quality 0.1–1"),
                     ], required: ["id", "action"]),
                     readOnly: false, destructive: true) { a, ctx in
                 if a.str("action") == "flatten" {
@@ -176,7 +178,13 @@ enum MCPTools {
                     return ToolOutput(text: "Flattened “\(rec.title)”: annotations and form values are now part of the pages.", structured: doc(rec))
                 }
                 guard let action = a.str("action").flatMap(EzPDF.Optimization.init) else { throw EzPDFError.invalidInput("Unknown action.") }
-                let r = try await ops.optimize(try a.need("id"), action, password: a.str("password"), text: a.str("text"))
+                var settings: ImageCompressor.Settings?
+                let dpi = a.int("dpi", in: 36...1200), quality = a.double("quality", in: 0.1...1)
+                if dpi != nil || quality != nil {
+                    let base: ImageCompressor.Settings = action == .compress_strong ? .small : .balanced
+                    settings = ImageCompressor.Settings(maxDPI: dpi.map(Double.init) ?? base.maxDPI, quality: quality ?? base.quality)
+                }
+                let r = try await ops.optimize(try a.need("id"), action, password: a.str("password"), text: a.str("text"), compression: settings)
                 let size = action == .compress || action == .compress_strong
                     ? (r.after < r.before ? " \(kb(r.before)) → \(kb(r.after))." : " It was already as small as this setting gets.") : ""
                 return ToolOutput(text: "Done: \(action.rawValue) on “\(r.record.title)”.\(size)", structured: ["document": doc(r.record), "bytes_before": r.before, "bytes_after": r.after])
@@ -541,9 +549,13 @@ enum MCPTools {
             },
 
             MCPTool(name: "export_file", title: "Save a copy",
-                    description: "Save the PDF or EPUB, or the extracted data as a spreadsheet (csv, xlsx or json), to the user's ezpdf export folder (Downloads unless changed) and return its path.",
+                    description: "Save a copy to the user's ezpdf export folder (Downloads unless changed) and return its path: the PDF or EPUB; the document converted to Word (docx: headings, paragraphs, lists, tables and figures), Markdown (md, figures in a folder beside it) or plain text (txt); page images (png or jpg, one per page, in a folder when there are several); or the extracted data as a spreadsheet (csv, xlsx or json). Scanned pages are read with OCR on the Mac.",
                     schema: S.object(["id": S.string("Document id or title"),
-                                      "format": S.string("pdf (default), epub, or csv/xlsx/json for extracted data", enum: ["pdf", "epub", "csv", "xlsx", "json"]),
+                                      "format": S.string("pdf (default), epub, docx, md, txt, png, jpg, or csv/xlsx/json for extracted data",
+                                                         enum: ["pdf", "epub"] + PDFConverter.Format.allCases.map(\.rawValue) + ["csv", "xlsx", "json"]),
+                                      "pages": S.string("docx/md/txt/png/jpg: only these pages, e.g. 1-3,5"),
+                                      "dpi": S.int("png/jpg: pixels per inch (default 150, up to 600)"),
+                                      "quality": S.number("jpg: quality 0.1–1 (default 0.85)"),
                                       "kind": S.string("For csv/xlsx/json: auto, statement, invoice or tables", enum: ["auto", "statement", "invoice", "tables"]),
                                       "subfolder": S.string("Optional folder name inside the export folder")], required: ["id"]),
                     readOnly: false) { a, ctx in
@@ -551,7 +563,13 @@ enum MCPTools {
                 let folder = try a.str("subfolder").map { try FileAccess.exportSubfolder($0, in: ops.exportFolder) }
                 let format = a.str("format") ?? "pdf"
                 let url: URL
-                if let data = EzPDF.DataFormat(rawValue: format) {
+                if let convert = PDFConverter.Format(rawValue: format) {
+                    let r = try await ops.exportConverted(id, format: convert, pages: a.str("pages"), dpi: a.int("dpi", in: 36...600),
+                                                          quality: a.double("quality", in: 0.1...1), folder: folder, source: .agent)
+                    let what = r.files > 1 && convert.isImage ? "\(r.files) page images in" : "\(convert.label) file"
+                    let notes = r.notes.isEmpty ? "" : " (" + r.notes.joined(separator: "; ") + ")"
+                    return ToolOutput(text: "Saved \(what) \(r.url.path)\(notes)", structured: ["path": r.url.path, "files": r.files])
+                } else if let data = EzPDF.DataFormat(rawValue: format) {
                     let result = try await ops.extract(id, kind: ExtractKind.parse(a.str("kind")), source: .agent)
                     url = try ops.saveExtraction(result, for: id, format: data, folder: folder)
                 } else {
